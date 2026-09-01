@@ -6,39 +6,50 @@
 #include <signal.h>
 #include <time.h>
 
-static LoadBalancer* lb = NULL;
-static volatile int running = 1;
+/*
+ * sig_atomic_t is the only type the C standard guarantees can be written by a
+ * signal handler and read by the interrupted code without tearing; volatile
+ * stops the compiler caching it in a register across the sleep loop.
+ */
+static volatile sig_atomic_t running = 1;
 
-void signal_handler(int signum) {
-    if (signum == SIGINT) {
-        printf("\nReceived Ctrl+C, initiating graceful shutdown...\n");
-        if (lb) {
-            log_message(LOG_INFO, "Received shutdown signal, initiating graceful shutdown");
-            stop_load_balancer(lb);
-        }
-        running = 0;
-    }
+/*
+ * Async-signal-safe: it does nothing but set a flag.
+ *
+ * The previous version called printf(), log_message() and stop_load_balancer()
+ * from here. None of those are async-signal-safe, and stop_load_balancer()
+ * takes mutexes — if the signal interrupted a thread that already held one,
+ * the handler would deadlock against it. The real shutdown now runs in main().
+ */
+static void handle_sigint(int signum) {
+    (void)signum;
+    running = 0;
 }
 
-// Modified CPU task that runs for 1-3 seconds
+// CPU task that runs for 1-3 seconds
 void cpu_task(void* arg) {
     int task_id = *(int*)arg;
     time_t start_time = time(NULL);
-    
-    // Generate random duration between 1-3 seconds
-    int duration = (rand() % 3) + 1;
+
+    /* rand() keeps its state in a single shared static, so calling it from
+     * several task threads at once is a data race. rand_r() keeps the state in
+     * a local seeded per task. */
+    unsigned int seed = (unsigned int)(time(NULL) ^ (task_id * 2654435761u));
+
+    int duration = (rand_r(&seed) % 3) + 1;
     double result = 0.0;
-    
+
     time_t current_time;
     do {
         // Perform some CPU-intensive calculations
         for (int i = 0; i < 10000; i++) {
-            result += rand() / (double)RAND_MAX;
+            result += rand_r(&seed) / (double)RAND_MAX;
         }
         current_time = time(NULL);
     } while (difftime(current_time, start_time) < duration);
-    
-    log_message(LOG_INFO, "Task %d completed after %d seconds", task_id, duration);
+
+    log_message(LOG_INFO, "Task %d completed after %d seconds (checksum %.2f)",
+                task_id, duration, result);
     free(arg);
 }
 
@@ -53,91 +64,117 @@ int main(int argc, char** argv) {
         print_usage(argv[0]);
         return 1;
     }
-    
+
     // Parse command line arguments
     int num_cores = atoi(argv[1]);
     int num_tasks = atoi(argv[2]);
-    
+
     // Validate number of cores
     int max_cores = sysconf(_SC_NPROCESSORS_ONLN);
     if (num_cores < 1 || num_cores > max_cores) {
         fprintf(stderr, "Error: Invalid number of cores. Must be between 1 and %d\n", max_cores);
         return 1;
     }
-    
+
     // Validate number of tasks
     if (num_tasks < 1) {
         fprintf(stderr, "Error: Invalid number of tasks. Must be greater than 0\n");
         return 1;
     }
-    
-    // Set up signal handler
-    signal(SIGINT, signal_handler);
-    
-    // Initialize random seed
-    srand(time(NULL));
-    
+
+    /* sigaction rather than signal(): signal()'s behaviour around handler
+     * reinstatement and syscall restart varies between platforms. */
+    struct sigaction sa;
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGINT, &sa, NULL) != 0) {
+        perror("sigaction");
+        return 1;
+    }
+
     // Initialize load balancer with custom configuration
     LoadBalancerConfig* config = init_default_config();
     if (!config) {
         fprintf(stderr, "Failed to initialize configuration\n");
         return 1;
     }
-    
+
     // Modify configuration for our needs
     config->max_tasks = num_tasks;
     config->monitoring_interval_ms = 500;  // Monitor every 500ms
     config->enable_detailed_logging = 1;
     config->num_cpus = num_cores;
 
-    lb = init_load_balancer(config);
+    LoadBalancer* lb = init_load_balancer(config);
     if (!lb) {
         fprintf(stderr, "Failed to initialize load balancer\n");
-        fflush(stderr);
         free_config(config);
         return 1;
     }
-    
+
     // Start the load balancer
     start_load_balancer(lb);
-    fprintf(stdout, "Started load balancer with %d cores and %d tasks\n", num_cores, num_tasks);
+    printf("Started load balancer with %d cores and %d tasks\n", num_cores, num_tasks);
     fflush(stdout);
-    
+
+    unsigned int submit_seed = (unsigned int)time(NULL);
+
     // Submit tasks
+    int submitted = 0;
     for (int i = 0; i < num_tasks && running; i++) {
         int* task_id = malloc(sizeof(int));
+        if (!task_id) break;
         *task_id = i + 1;
-        
-        // Assign random priority
-        TaskPriority priority = (TaskPriority)(rand() % 3);  // 0=LOW, 1=MEDIUM, 2=HIGH
-        
+
+        /* Keep a plain copy for logging. Once submit_task() succeeds the task
+         * thread owns this block and may free it at any moment, so reading
+         * *task_id after that point is a use-after-free. */
+        int id_for_log = *task_id;
+
+        /* % TASK_PRIORITY_LEVELS, so PRIORITY_CRITICAL is actually reachable —
+         * the original used % 3 and could never produce it. */
+        TaskPriority priority =
+            (TaskPriority)(rand_r(&submit_seed) % TASK_PRIORITY_LEVELS);
+
         if (submit_task(lb, cpu_task, task_id, priority) == 0) {
-            log_message(LOG_INFO, "Submitted task %d with priority %d", *task_id, priority);
-            printf("Submitted task %d\n", *task_id);
+            log_message(LOG_INFO, "Submitted task %d with priority %d", id_for_log, priority);
+            printf("Submitted task %d (priority %d)\n", id_for_log, priority);
+            submitted++;
         } else {
-            log_message(LOG_ERROR, "Failed to submit task %d", *task_id);
+            log_message(LOG_ERROR, "Failed to submit task %d", id_for_log);
             free(task_id);
         }
-        
-        // Small delay between task submissions to prevent overwhelming the system
+
+        // Small delay between submissions to prevent overwhelming the system
         usleep(100000);  // 100ms delay
     }
-    
-    // Wait for completion or interrupt
-    fprintf(stdout, "All tasks submitted. Press Ctrl+C to stop...\n");
+
+    printf("All %d task(s) submitted. Waiting for completion (Ctrl+C to stop early)...\n",
+           submitted);
     fflush(stdout);
+
+    /* Exit on its own once the queue has drained and every task thread has
+     * finished, so a demo run terminates without needing a keypress. */
     while (running) {
-        sleep(1);
+        if (task_queue_size(lb->task_queue) == 0 &&
+            load_balancer_active_tasks(lb) == 0) {
+            break;
+        }
+        usleep(100000);
     }
-    if(!running) { 
-        log_message(LOG_INFO, "Load balancer stopped running gracefully");
+
+    if (!running) {
+        printf("\nReceived Ctrl+C, initiating graceful shutdown...\n");
+        log_message(LOG_INFO, "Received shutdown signal, initiating graceful shutdown");
     }
+
     // Cleanup
     printf("Cleaning up...\n");
-    // stop_load_balancer(lb);
-    // cleanup_load_balancer(lb);
+    cleanup_load_balancer(lb);   /* stops threads, then frees monitor + queue */
     free_config(config);
-    
+    cleanup_logger();
+
     printf("Successfully terminated.\n");
     return 0;
 }

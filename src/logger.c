@@ -18,10 +18,18 @@ void log_message(LogLevel level, const char* format, ...) {
     
     pthread_mutex_lock(&log_mutex);
     
+    /* ctime() returns a pointer to a single shared static buffer; two threads
+     * logging at once would overwrite each other's timestamp. ctime_r() writes
+     * into a caller-supplied buffer instead. */
     time_t now;
     time(&now);
-    char* date = ctime(&now);
-    date[strlen(date) - 1] = '\0';
+    char date[32];
+    if (ctime_r(&now, date)) {
+        size_t len = strlen(date);
+        if (len > 0 && date[len - 1] == '\n') date[len - 1] = '\0';
+    } else {
+        date[0] = '\0';
+    }
     
     const char* level_str;
     switch (level) {

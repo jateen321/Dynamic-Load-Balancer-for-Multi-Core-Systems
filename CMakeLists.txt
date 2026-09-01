@@ -18,15 +18,6 @@ add_compile_definitions(_GNU_SOURCE)
 
 # Check for required libraries
 find_package(Threads REQUIRED)
-find_package(PkgConfig REQUIRED)
-
-pkg_check_modules(JSONC REQUIRED json-c)
-if (JSONC_FOUND)
-    include_directories(${JSONC_INCLUDE_DIRS})
-    link_directories(${JSONC_LIBRARY_DIRS})
-else()
-    message(FATAL_ERROR "json-c library not found.")
-endif()
 
 # Define source and header files
 set(SOURCES
@@ -54,16 +45,13 @@ add_executable(cpu_balancer ${SOURCES})
 # Include directories
 target_include_directories(cpu_balancer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${JSONC_INCLUDE_DIRS}
 )
 
 # Link libraries
 target_link_libraries(cpu_balancer
     PRIVATE
         Threads::Threads
-        ${JSONC_LIBRARIES}
         m
-        pthread
         rt
 )
 

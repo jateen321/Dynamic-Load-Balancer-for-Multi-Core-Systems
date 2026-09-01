@@ -12,8 +12,6 @@ typedef struct {
     int enable_load_prediction;
     int enable_detailed_logging;
     char* log_file_path;
-    int rebalance_threshold;
-    int min_task_runtime_ms;
     int num_cpus;
 } LoadBalancerConfig;
 

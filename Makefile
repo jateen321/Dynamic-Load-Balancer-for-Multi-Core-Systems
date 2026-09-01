@@ -1,24 +1,35 @@
-#!/bin/bash
+.PHONY: all build clean rebuild run tsan asan install
 
-.PHONY: all clean build rebuild docs test install
+BUILD_DIR ?= build
+CORES     ?= 4
+TASKS     ?= 20
 
 all: build
 
 build:
-	mkdir -p build
-	cd build && cmake .. && make
+	cmake -S . -B $(BUILD_DIR)
+	cmake --build $(BUILD_DIR)
 
 clean:
-	rm -rf build
+	rm -rf $(BUILD_DIR) build-tsan build-asan
 
 rebuild: clean build
 
-docs:
-	cd build && make docs
+# Smoke run: $(CORES) cores, $(TASKS) tasks
+run: build
+	./$(BUILD_DIR)/cpu_balancer $(CORES) $(TASKS)
 
-test:
-	cd build && ctest --output-on-failure
+# Data-race detector build
+tsan:
+	cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
+	      -DCMAKE_C_FLAGS="-fsanitize=thread -g -O1"
+	cmake --build build-tsan
 
-install:
-	cd build && sudo make install
+# Memory-error detector build
+asan:
+	cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+	      -DCMAKE_C_FLAGS="-fsanitize=address,undefined -g -O1"
+	cmake --build build-asan
 
+install: build
+	cmake --install $(BUILD_DIR)

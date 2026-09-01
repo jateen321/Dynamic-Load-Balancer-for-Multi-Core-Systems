@@ -2,3 +2,8 @@ bin/
 obj/
 .vscode/
 build/
+build-tsan/
+build-asan/
+
+# Runtime output
+*.log

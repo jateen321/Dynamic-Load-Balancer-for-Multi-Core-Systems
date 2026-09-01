@@ -19,14 +19,27 @@ CPUMonitor* init_cpu_monitor(LoadBalancerConfig* config) {
     }
     
     for (int i = 0; i < monitor->num_cpus; i++) {
-        monitor->stats[i].cpu_id = i;
-        monitor->stats[i].current_usage = 0.0;
-        monitor->stats[i].usage_history = malloc(sizeof(double) * config->load_history_size);
-        monitor->stats[i].history_index = 0;
-        monitor->stats[i].active_tasks = 0;
-        memset(monitor->stats[i].usage_history, 0, sizeof(double) * config->load_history_size);
+        CPUStats* cpu = &monitor->stats[i];
+
+        /* Every field must start at a known value: update_cpu_stats() subtracts
+         * the previous jiffie counters from the current ones, so uninitialized
+         * *_time fields would make the very first usage reading garbage. */
+        memset(cpu, 0, sizeof(*cpu));
+        cpu->cpu_id = i;
+
+        cpu->usage_history = calloc(config->load_history_size, sizeof(double));
+        if (!cpu->usage_history) {
+            for (int j = 0; j < i; j++) {
+                free(monitor->stats[j].usage_history);
+            }
+            free(monitor->stats);
+            free(monitor);
+            return NULL;
+        }
     }
-    
+
+    pthread_mutex_init(&monitor->lock, NULL);
+
     return monitor;
 }
 
@@ -39,17 +52,29 @@ void update_cpu_stats(CPUMonitor* monitor) {
     
     char line[256];
     // Skip first line (aggregate CPU stats)
-    fgets(line, sizeof(line), fp);
-    
+    if (!fgets(line, sizeof(line), fp)) {
+        log_message(LOG_ERROR, "Unexpected end of /proc/stat");
+        fclose(fp);
+        return;
+    }
+
+    pthread_mutex_lock(&monitor->lock);
+
     for (int i = 0; i < monitor->num_cpus; i++) {
         if (fgets(line, sizeof(line), fp)) {
             CPUStats* cpu = &monitor->stats[i];
             uint64_t user, nice, system, idle, iowait, irq, softirq, steal;
-            
-            sscanf(line, "cpu%*d %lu %lu %lu %lu %lu %lu %lu %lu",
-                   &user, &nice, &system, &idle,
-                   &iowait, &irq, &softirq, &steal);
-            
+
+            /* Ran past the per-core lines (fewer cores than configured). */
+            if (strncmp(line, "cpu", 3) != 0) break;
+
+            if (sscanf(line, "cpu%*d %lu %lu %lu %lu %lu %lu %lu %lu",
+                       &user, &nice, &system, &idle,
+                       &iowait, &irq, &softirq, &steal) != 8) {
+                log_message(LOG_WARNING, "Malformed /proc/stat line for CPU %d", i);
+                continue;
+            }
+
             uint64_t prev_idle = cpu->idle_time + cpu->iowait_time;
             uint64_t idle_time = idle + iowait;
             
@@ -63,13 +88,23 @@ void update_cpu_stats(CPUMonitor* monitor) {
             
             uint64_t total_delta = total_time - prev_total;
             uint64_t idle_delta = idle_time - prev_idle;
-            
-            cpu->current_usage = 100.0 * (1.0 - ((double)idle_delta / total_delta));
-            
-            // Update history
-            cpu->usage_history[cpu->history_index] = cpu->current_usage;
-            cpu->history_index = (cpu->history_index + 1) % monitor->config->load_history_size;
-            
+
+            /* No jiffies elapsed between samples (first reading, or polled
+             * faster than the kernel's tick): keep the previous figure rather
+             * than dividing by zero. */
+            if (total_delta > 0) {
+                cpu->current_usage =
+                    100.0 * (1.0 - ((double)idle_delta / (double)total_delta));
+
+                // Update history
+                cpu->usage_history[cpu->history_index] = cpu->current_usage;
+                cpu->history_index =
+                    (cpu->history_index + 1) % monitor->config->load_history_size;
+                if (cpu->history_count < monitor->config->load_history_size) {
+                    cpu->history_count++;
+                }
+            }
+
             // Update raw stats
             cpu->user_time = user;
             cpu->nice_time = nice;
@@ -85,21 +120,65 @@ void update_cpu_stats(CPUMonitor* monitor) {
             }
         }
     }
-    
+
+    pthread_mutex_unlock(&monitor->lock);
+
     fclose(fp);
 }
 
-double predict_cpu_load(CPUStats* cpu) {
-    // Simple moving average prediction
-    double sum = 0.0;
-    int count = 0;
-    
-    for (int i = 0; i < cpu->history_index; i++) {
-        sum += cpu->usage_history[i];
-        count++;
+void check_load_balance(CPUMonitor* monitor) {
+    if (!monitor || monitor->num_cpus < 2) return;
+
+    double highest = 0.0, lowest = 100.0;
+    int busiest = 0, idlest = 0;
+
+    pthread_mutex_lock(&monitor->lock);
+    for (int i = 0; i < monitor->num_cpus; i++) {
+        double usage = monitor->stats[i].current_usage;
+        if (usage > highest) { highest = usage; busiest = i; }
+        if (usage < lowest)  { lowest = usage;  idlest = i; }
     }
-    
-    return count > 0 ? sum / count : cpu->current_usage;
+    pthread_mutex_unlock(&monitor->lock);
+
+    /* One core saturated while another sits idle is the imbalance this whole
+     * program exists to avoid, so it is worth a log line when it happens. */
+    if (highest > monitor->config->high_load_threshold &&
+        lowest < monitor->config->low_load_threshold) {
+        log_message(LOG_WARNING,
+                    "Load imbalance: CPU %d at %.1f%% (above %.1f) while CPU %d "
+                    "at %.1f%% (below %.1f)",
+                    busiest, highest, monitor->config->high_load_threshold,
+                    idlest, lowest, monitor->config->low_load_threshold);
+    }
+}
+
+void cpu_monitor_adjust_active_tasks(CPUMonitor* monitor, int cpu_id, int delta) {
+    if (!monitor || cpu_id < 0 || cpu_id >= monitor->num_cpus) return;
+
+    pthread_mutex_lock(&monitor->lock);
+    monitor->stats[cpu_id].active_tasks += delta;
+    if (monitor->stats[cpu_id].active_tasks < 0) {
+        monitor->stats[cpu_id].active_tasks = 0;
+    }
+    pthread_mutex_unlock(&monitor->lock);
+}
+
+double predict_cpu_load(CPUStats* cpu) {
+    /* Simple moving average over the samples we actually hold.
+     * Note this averages history_count entries, not history_index: the latter
+     * is a write cursor that wraps back to 0, so using it as a count would
+     * shrink the window to nothing every time the ring wrapped. */
+    double sum = 0.0;
+
+    if (cpu->history_count == 0) {
+        return cpu->current_usage;
+    }
+
+    for (int i = 0; i < cpu->history_count; i++) {
+        sum += cpu->usage_history[i];
+    }
+
+    return sum / cpu->history_count;
 }
 
 
@@ -111,6 +190,8 @@ void print_cpu_stats(CPUMonitor* monitor) {
 
     printf("CPU Usage Statistics:\n");
     printf("------------------------------------------------------------\n");
+
+    pthread_mutex_lock(&monitor->lock);
 
     for (int i = 0; i < monitor->num_cpus; ++i) {
         CPUStats* cpu = &monitor->stats[i];
@@ -125,23 +206,28 @@ void print_cpu_stats(CPUMonitor* monitor) {
         printf("  IRQ Time: %lu\n", cpu->irq_time);
         printf("  SoftIRQ Time: %lu\n", cpu->softirq_time);
         printf("  Steal Time: %lu\n", cpu->steal_time);
-        printf("  Temperature: %.2f°C\n", cpu->temperature);
         printf("  Predicted Load: %.2f%%\n", cpu->predicted_load);
         printf("  Active Tasks: %d\n", cpu->active_tasks);
         
-        if (cpu->usage_history != NULL) {
-            printf("  Usage History (last 5 samples): ");
-            for (int j = 0; j < 5 && j < cpu->history_index; ++j) {
-                printf("%.2f%% ", cpu->usage_history[j]);
+        if (cpu->usage_history != NULL && cpu->history_count > 0) {
+            int hist_size = monitor->config->load_history_size;
+            int shown = cpu->history_count < 5 ? cpu->history_count : 5;
+
+            /* Walk backwards from the write cursor so these really are the
+             * most recent samples, oldest of the five printed first. */
+            printf("  Usage History (last %d samples): ", shown);
+            for (int j = shown; j >= 1; --j) {
+                int idx = (cpu->history_index - j + hist_size) % hist_size;
+                printf("%.2f%% ", cpu->usage_history[idx]);
             }
             printf("\n");
         }
 
         printf("------------------------------------------------------------\n");
     }
-}
 
-#include <stdlib.h>
+    pthread_mutex_unlock(&monitor->lock);
+}
 
 void cleanup_cpu_monitor(CPUMonitor* monitor) {
     if (monitor == NULL) {
@@ -164,12 +250,11 @@ void cleanup_cpu_monitor(CPUMonitor* monitor) {
         monitor->stats = NULL;
     }
 
-    // Free the configuration if allocated
-    if (monitor->config != NULL) {
-        free(monitor->config);
-        monitor->config = NULL;
-    }
-
-    // Reset the number of CPUs
+    /* The monitor borrows the config; it does not own it. main() allocates it
+     * and frees it via free_config(), so freeing it here would double-free. */
+    monitor->config = NULL;
     monitor->num_cpus = 0;
+
+    pthread_mutex_destroy(&monitor->lock);
+    free(monitor);
 }
