@@ -50,7 +50,8 @@ void cpu_task(void* arg) {
 
     log_message(LOG_INFO, "Task %d completed after %d seconds (checksum %.2f)",
                 task_id, duration, result);
-    free(arg);
+    /* No free(arg) here: the library owns args and destroys them via the
+     * destructor passed to submit_task(). Freeing here would double-free. */
 }
 
 void print_usage(const char* program_name) {
@@ -110,11 +111,21 @@ int main(int argc, char** argv) {
     if (!lb) {
         fprintf(stderr, "Failed to initialize load balancer\n");
         free_config(config);
+        cleanup_logger();   /* init_load_balancer opens the logger before it can fail */
         return 1;
     }
 
-    // Start the load balancer
-    start_load_balancer(lb);
+    /* Check the result: a failed start used to be silent, and main would go on
+     * to submit every task into a queue no scheduler would ever drain, print a
+     * full success transcript, and then hang forever in the wait loop. */
+    if (start_load_balancer(lb) != 0) {
+        fprintf(stderr, "Failed to start load balancer\n");
+        cleanup_load_balancer(lb);
+        free_config(config);
+        cleanup_logger();
+        return 1;
+    }
+
     printf("Started load balancer with %d cores and %d tasks\n", num_cores, num_tasks);
     fflush(stdout);
 
@@ -127,9 +138,9 @@ int main(int argc, char** argv) {
         if (!task_id) break;
         *task_id = i + 1;
 
-        /* Keep a plain copy for logging. Once submit_task() succeeds the task
-         * thread owns this block and may free it at any moment, so reading
-         * *task_id after that point is a use-after-free. */
+        /* Keep a plain copy for logging. submit_task() takes ownership of the
+         * block on entry — success or failure — so reading *task_id after the
+         * call is a use-after-free either way. */
         int id_for_log = *task_id;
 
         /* % TASK_PRIORITY_LEVELS, so PRIORITY_CRITICAL is actually reachable —
@@ -137,13 +148,17 @@ int main(int argc, char** argv) {
         TaskPriority priority =
             (TaskPriority)(rand_r(&submit_seed) % TASK_PRIORITY_LEVELS);
 
-        if (submit_task(lb, cpu_task, task_id, priority) == 0) {
+        /* Passing `free` as the destructor is the point of the design: the
+         * ownership decision is visible at the call site instead of being an
+         * unwritten rule spread across five files. */
+        if (submit_task(lb, cpu_task, task_id, free, priority) == 0) {
             log_message(LOG_INFO, "Submitted task %d with priority %d", id_for_log, priority);
             printf("Submitted task %d (priority %d)\n", id_for_log, priority);
             submitted++;
         } else {
+            /* No free(task_id): ownership transferred on entry, so submit_task
+             * has already destroyed it. */
             log_message(LOG_ERROR, "Failed to submit task %d", id_for_log);
-            free(task_id);
         }
 
         // Small delay between submissions to prevent overwhelming the system
@@ -155,7 +170,9 @@ int main(int argc, char** argv) {
     fflush(stdout);
 
     /* Exit on its own once the queue has drained and every task thread has
-     * finished, so a demo run terminates without needing a keypress. */
+     * finished, so a demo run terminates without needing a keypress. This loop
+     * is a convenience, not a correctness mechanism: cleanup_load_balancer()
+     * below blocks until every task thread has been joined regardless. */
     while (running) {
         if (task_queue_size(lb->task_queue) == 0 &&
             load_balancer_active_tasks(lb) == 0) {
@@ -169,9 +186,11 @@ int main(int argc, char** argv) {
         log_message(LOG_INFO, "Received shutdown signal, initiating graceful shutdown");
     }
 
-    // Cleanup
+    /* Cleanup. This order is load-bearing, do not reorder: the first call
+     * blocks until every task thread has been joined, which is what makes it
+     * safe to free the config and close the log a task might still be using. */
     printf("Cleaning up...\n");
-    cleanup_load_balancer(lb);   /* stops threads, then frees monitor + queue */
+    cleanup_load_balancer(lb);
     free_config(config);
     cleanup_logger();
 

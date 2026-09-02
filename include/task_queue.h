@@ -42,7 +42,8 @@ Task* dequeue_task(TaskQueue* queue);
 /* Wakes every blocked producer and consumer so they can observe shutdown. */
 void shutdown_task_queue(TaskQueue* queue);
 
-/* Frees all still-queued tasks (and their args). Returns how many were dropped. */
+/* Frees all still-queued tasks, running each one's args destructor. Returns
+ * how many were dropped. */
 int drain_task_queue(TaskQueue* queue);
 
 /* Current number of queued tasks, read under the queue lock. */

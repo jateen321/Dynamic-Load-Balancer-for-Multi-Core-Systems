@@ -93,7 +93,8 @@ Load Balancer
   updates per-core usage and predictions, flags load imbalance.
 - **Scheduler thread** — blocks on the queue, picks a core for each task, and
   spawns a pinned, detached thread to run it.
-- **Task threads** — one detached thread per task.
+- **Task threads** — one joinable thread per task, tracked in a registry so
+  shutdown joins every one of them rather than waiting on a timeout.
 - **Main thread** — submits tasks, waits for drain, owns the shutdown sequence.
 
 `SIGINT` is blocked in the scheduler thread so the signal is always delivered
@@ -105,14 +106,52 @@ to main.
 
 ```c
 LoadBalancer* init_load_balancer(LoadBalancerConfig* config);
-int  submit_task(LoadBalancer* lb, void (*function)(void*), void* args, TaskPriority priority);
-void start_load_balancer(LoadBalancer* lb);
+int  start_load_balancer(LoadBalancer* lb);          /* 0 on success, -1 on failure */
+int  submit_task(LoadBalancer* lb, void (*function)(void*), void* args,
+                 TaskArgsDestructor args_free, TaskPriority priority);
 void stop_load_balancer(LoadBalancer* lb);
 void cleanup_load_balancer(LoadBalancer* lb);
 ```
 
 `running` is an `atomic_int`, not a plain `int` — it is written by the shutdown
 path and read by both worker threads.
+
+#### Argument ownership
+
+`submit_task` **takes ownership of `args` on entry**. On return — success or
+failure — the caller must not touch `args` again; the library destroys it
+exactly once via `args_free`, whether the task ran, was cancelled at shutdown,
+or was rejected outright.
+
+```c
+int* id = malloc(sizeof(int));
+submit_task(lb, cpu_task, id, free, PRIORITY_MEDIUM);   /* library owns id now */
+```
+
+Pass `NULL` as the destructor to state that the library must *not* free the
+args — correct for a stack address, a string literal, a pointer into a
+caller-owned arena, or an integer encoded in a pointer. `NULL` means
+non-ownership, not "use `free`".
+
+Transfer happens on entry rather than on success so the caller has no branch to
+get wrong. The previous design had three contradictory rules — the task function
+freed args on success, the library freed them on cancel, and the caller freed
+them on submit failure — which no caller could satisfy without reading the
+implementation, and which silently leaked any args holding internal pointers.
+
+#### Task thread lifetime
+
+Task threads are joinable and registered before they can run. Shutdown closes
+the registry, waits for the live count to reach zero, and joins every thread
+before anything is freed.
+
+This matters because a condition variable can only report that a counter
+reached zero; `pthread_join` is the only primitive that reports that a thread
+will never execute another instruction. The earlier design detached its task
+threads and waited on a 5-second timeout, so a task outliving that timeout kept
+running while `cleanup_load_balancer` freed the balancer underneath it —
+a use-after-free on `lb->cpu_monitor`, reproducible under ASan. The timeout is
+now a diagnostic that logs and keeps waiting, never an exit.
 
 ### 2. CPU Monitor (`cpu_stats.h`)
 
@@ -289,10 +328,15 @@ Checked on a 4-core Linux box, GCC 13.3:
 |---|---|
 | `-Wall -Wextra -Wpedantic` | 0 warnings |
 | Normal run to completion | exit 0 |
-| `SIGINT` mid-run | graceful, ~1.5 s (time spent waiting for in-flight tasks) |
-| ThreadSanitizer | 0 data races |
+| `SIGINT` mid-run | graceful, time spent waiting for in-flight tasks |
+| ThreadSanitizer, normal path | 0 data races |
+| ThreadSanitizer, `SIGINT` path | 0 data races |
 | Valgrind, normal path | `All heap blocks were freed`, 0 errors |
 | Valgrind, `SIGINT` path | `All heap blocks were freed`, 0 errors |
+| ASan: task outliving shutdown | no use-after-free; cleanup blocks until joined |
+| ASan: multi-block args cancelled at shutdown | destroyed exactly once, 0 leaks |
+| ASan: non-owned args, `NULL` destructor | never freed |
+| Priority queue ordering + FIFO within level | pass |
 
 ## Known Limitations
 
@@ -307,6 +351,11 @@ Stated explicitly rather than implied by omission:
   imbalance but does not act on it.
 - **Thread-per-task, not a thread pool.** Every task gets a fresh thread.
   Fine at this scale, wasteful at thousands of short tasks.
+- **One logger per process.** The logger's state is file-scope, so two
+  LoadBalancer instances in one process would share (and reconfigure) it. The
+  active-task accounting is now per-instance, but the logger is not.
+- **`stop_load_balancer` is idempotent for sequential calls, not for
+  concurrent ones.** Two threads calling it at once is not supported.
 - **`CPUStats::temperature` is never populated.** The field exists; nothing
   reads a thermal zone.
 - **No unit test suite in-tree.** Correctness was checked with the sanitizers
