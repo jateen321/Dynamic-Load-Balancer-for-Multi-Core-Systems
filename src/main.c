@@ -2,6 +2,7 @@
 #include "logger.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
@@ -55,13 +56,22 @@ void cpu_task(void* arg) {
 }
 
 void print_usage(const char* program_name) {
-    fprintf(stderr, "Usage: %s <num_cores> <num_tasks>\n", program_name);
+    fprintf(stderr, "Usage: %s <num_cores> <num_tasks> [policy]\n", program_name);
     fprintf(stderr, "  num_cores: Number of CPU cores to use (1-%ld)\n", sysconf(_SC_NPROCESSORS_ONLN));
     fprintf(stderr, "  num_tasks: Number of tasks to generate\n");
+    fprintf(stderr, "  policy:    round_robin | least_load | predictive (default: predictive)\n");
+}
+
+/* Returns 1 and sets *out on a recognized name, 0 otherwise. */
+static int parse_policy(const char* name, SchedulingPolicy* out) {
+    if (strcmp(name, "round_robin") == 0) { *out = SCHED_ROUND_ROBIN; return 1; }
+    if (strcmp(name, "least_load") == 0)  { *out = SCHED_LEAST_LOAD;  return 1; }
+    if (strcmp(name, "predictive") == 0)  { *out = SCHED_PREDICTIVE;  return 1; }
+    return 0;
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    if (argc != 3 && argc != 4) {
         print_usage(argv[0]);
         return 1;
     }
@@ -69,6 +79,13 @@ int main(int argc, char** argv) {
     // Parse command line arguments
     int num_cores = atoi(argv[1]);
     int num_tasks = atoi(argv[2]);
+
+    SchedulingPolicy policy = SCHED_PREDICTIVE;
+    if (argc == 4 && !parse_policy(argv[3], &policy)) {
+        fprintf(stderr, "Error: unknown policy '%s'\n", argv[3]);
+        print_usage(argv[0]);
+        return 1;
+    }
 
     // Validate number of cores
     int max_cores = sysconf(_SC_NPROCESSORS_ONLN);
@@ -106,6 +123,7 @@ int main(int argc, char** argv) {
     config->monitoring_interval_ms = 500;  // Monitor every 500ms
     config->enable_detailed_logging = 1;
     config->num_cpus = num_cores;
+    config->scheduling_policy = policy;
 
     LoadBalancer* lb = init_load_balancer(config);
     if (!lb) {
@@ -126,7 +144,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("Started load balancer with %d cores and %d tasks\n", num_cores, num_tasks);
+    printf("Started load balancer with %d cores and %d tasks (policy: %s)\n",
+           num_cores, num_tasks, scheduling_policy_name(policy));
     fflush(stdout);
 
     unsigned int submit_seed = (unsigned int)time(NULL);
@@ -169,12 +188,13 @@ int main(int argc, char** argv) {
            submitted);
     fflush(stdout);
 
-    /* Exit on its own once the queue has drained and every task thread has
-     * finished, so a demo run terminates without needing a keypress. This loop
-     * is a convenience, not a correctness mechanism: cleanup_load_balancer()
-     * below blocks until every task thread has been joined regardless. */
+    /* Exit on its own once nothing is queued (globally or on any core) and
+     * nothing is executing, so a demo run terminates without needing a
+     * keypress. This loop is a convenience, not a correctness mechanism:
+     * cleanup_load_balancer() below blocks until every worker has drained
+     * regardless. */
     while (running) {
-        if (task_queue_size(lb->task_queue) == 0 &&
+        if (load_balancer_pending_tasks(lb) == 0 &&
             load_balancer_active_tasks(lb) == 0) {
             break;
         }

@@ -8,183 +8,14 @@
 #include <sched.h>
 #include <pthread.h>
 #include <errno.h>
+#include <sys/resource.h>
 
-/*
- * One per running task thread, and simultaneously the registry's list node.
- *
- * There is already exactly one heap allocation per in-flight task thread, so
- * making it the node removes the registry's capacity question entirely: no
- * growth policy, no free list, no slot reuse, and no allocation on the
- * completion path. Node lifetime is thread lifetime by construction.
- *
- * `tid` lives here rather than in Task because the task thread frees its own
- * Task — keeping the pthread_t there would leave the joiner reading freed
- * memory.
- */
-typedef struct TaskRun {
-    struct TaskRun* next;
-    LoadBalancer*   lb;
-    Task*           task;
-    pthread_t       tid;
-} TaskRun;
-
-/* ---------------------------------------------------------------------------
- * Task thread registry
- * ------------------------------------------------------------------------ */
-
-/*
- * Invariant, under registry->lock: every TaskRun whose thread was created
- * successfully is owned by exactly one of
- *   (1) its own thread, contributing 1 to live_count, or
- *   (2) the done_head list, awaiting join and free.
- * The (1) -> (2) transition happens in a single critical section, so there is
- * no moment where a thread belongs to neither. Therefore live_count == 0
- * implies done_head holds every outstanding thread.
- */
-
-static int registry_init(TaskThreadRegistry* reg) {
-    reg->done_head = NULL;
-    reg->live_count = 0;
-    reg->closed = 0;
-
-    if (pthread_mutex_init(&reg->lock, NULL) != 0) return -1;
-
-    if (pthread_cond_init(&reg->all_done, NULL) != 0) {
-        pthread_mutex_destroy(&reg->lock);
-        return -1;
-    }
-
-    return 0;
-}
-
-static void registry_destroy(TaskThreadRegistry* reg) {
-    /* Precondition: live_count == 0 and done_head == NULL. Destroying a mutex
-     * another thread may still lock is undefined. */
-    pthread_cond_destroy(&reg->all_done);
-    pthread_mutex_destroy(&reg->lock);
-}
-
-/*
- * Creates the thread WITH THE LOCK HELD, so it is counted before it can run.
- *
- * That ordering is the point. If the count were incremented inside the child
- * (as it used to be), then between dequeue_task() removing the task from the
- * queue and the child reaching its increment, the task would be in neither the
- * queue nor the counter — invisible to both terms of the caller's drain check.
- * A shutdown could then observe "queue empty and nothing active" and free the
- * balancer while a task was still starting up.
- *
- * Returns 0, ECANCELED if the registry is closed, or the pthread_create error.
- * On any non-zero return the caller still owns `run`.
- */
-static int registry_spawn(TaskThreadRegistry* reg, const pthread_attr_t* attr,
-                          void* (*fn)(void*), TaskRun* run) {
-    pthread_mutex_lock(&reg->lock);
-
-    if (reg->closed) {
-        pthread_mutex_unlock(&reg->lock);
-        return ECANCELED;
-    }
-
-    int rc = pthread_create(&run->tid, attr, fn, run);
-    if (rc == 0) {
-        reg->live_count++;
-    }
-
-    pthread_mutex_unlock(&reg->lock);
-    return rc;
-}
-
-/*
- * Called by a task thread as its LAST action. Nothing may follow it: once
- * live_count hits zero a waiter is free to tear the balancer down.
- */
-static void registry_finish(TaskThreadRegistry* reg, TaskRun* run) {
-    pthread_mutex_lock(&reg->lock);
-
-    run->next = reg->done_head;
-    reg->done_head = run;
-    reg->live_count--;
-
-    /* Broadcast while still holding the lock: a waiter that wakes may destroy
-     * all_done as soon as it can proceed. */
-    if (reg->live_count == 0) {
-        pthread_cond_broadcast(&reg->all_done);
-    }
-
-    pthread_mutex_unlock(&reg->lock);
-}
-
-/*
- * Joins and frees whatever has finished. Called once per scheduler iteration
- * so a long run does not accumulate unjoined thread stacks.
- *
- * Never joins while holding the lock: the joinee's exit path calls
- * registry_finish(), which wants that same lock. Steal the list, unlock, then
- * join — which is also why an intrusive list beats an array here, since
- * stealing it is two pointer assignments.
- */
-static void registry_reap(TaskThreadRegistry* reg) {
-    pthread_mutex_lock(&reg->lock);
-    TaskRun* list = reg->done_head;
-    reg->done_head = NULL;
-    pthread_mutex_unlock(&reg->lock);
-
-    while (list) {
-        TaskRun* next = list->next;
-        pthread_join(list->tid, NULL);
-        free(list);
-        list = next;
-    }
-}
-
-static void registry_close(TaskThreadRegistry* reg) {
-    pthread_mutex_lock(&reg->lock);
-    reg->closed = 1;
-    pthread_mutex_unlock(&reg->lock);
-}
-
-static int registry_live(TaskThreadRegistry* reg) {
-    pthread_mutex_lock(&reg->lock);
-    int live = reg->live_count;
-    pthread_mutex_unlock(&reg->lock);
-    return live;
-}
-
-/*
- * Waits for every task thread to finish, then joins them all.
- *
- * The 5-second deadline is a diagnostic, not an escape: it logs progress and
- * re-arms. Returning while a thread is still live is exactly what let cleanup
- * destroy this mutex out from under it.
- */
-static void registry_join_all(TaskThreadRegistry* reg) {
-    pthread_mutex_lock(&reg->lock);
-
-    while (reg->live_count > 0) {
-        struct timespec deadline;
-        clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += 5;
-
-        if (pthread_cond_timedwait(&reg->all_done, &reg->lock,
-                                   &deadline) == ETIMEDOUT) {
-            log_message(LOG_WARNING, "Still waiting for %d task thread(s)",
-                        reg->live_count);
-        }
-    }
-
-    /* live_count == 0, so by the invariant done_head holds every thread. */
-    TaskRun* list = reg->done_head;
-    reg->done_head = NULL;
-    pthread_mutex_unlock(&reg->lock);
-
-    while (list) {
-        TaskRun* next = list->next;
-        pthread_join(list->tid, NULL);
-        free(list);
-        list = next;
-    }
-}
+/* How long a worker's pop_own() blocks before it wakes to check whether it
+ * should try stealing, or whether it is time to exit. Short enough that an
+ * idle core notices a busy peer quickly; long enough that a steady stream of
+ * work never touches the timeout path at all (pop_own returns as soon as a
+ * task is pushed, regardless of this value). */
+#define WORKER_POLL_MS 20
 
 /* ---------------------------------------------------------------------------
  * Load balancer
@@ -198,8 +29,12 @@ LoadBalancer* init_load_balancer(LoadBalancerConfig* config) {
 
     lb->config = config;
     atomic_init(&lb->running, 0);
+    atomic_init(&lb->dispatcher_done, 0);
+    atomic_init(&lb->rr_cursor, 0);
+    atomic_init(&lb->tasks_in_flight, 0);
     lb->monitor_started = 0;
-    lb->scheduler_started = 0;
+    lb->dispatcher_started = 0;
+    lb->workers = NULL;
 
     /* Open the logger first, so the constructors below can actually report
      * their failures. A failed log file is not fatal — logging falls back to
@@ -209,15 +44,6 @@ LoadBalancer* init_load_balancer(LoadBalancerConfig* config) {
                 config->log_file_path ? config->log_file_path : "(null)");
     }
 
-    /* Initialised here rather than in start_load_balancer() so that a balancer
-     * which was never started, or whose start failed, still has valid
-     * primitives for cleanup_load_balancer() to destroy. */
-    if (registry_init(&lb->task_threads) != 0) {
-        log_message(LOG_ERROR, "Failed to initialize task thread registry");
-        free(lb);
-        return NULL;
-    }
-
     lb->cpu_monitor = init_cpu_monitor(config);
     lb->task_queue = init_task_queue(config->max_tasks);
 
@@ -225,7 +51,6 @@ LoadBalancer* init_load_balancer(LoadBalancerConfig* config) {
         log_message(LOG_ERROR, "Failed to initialize load balancer subsystems");
         cleanup_cpu_monitor(lb->cpu_monitor);
         cleanup_task_queue(lb->task_queue);
-        registry_destroy(&lb->task_threads);
         free(lb);
         return NULL;
     }
@@ -233,41 +58,148 @@ LoadBalancer* init_load_balancer(LoadBalancerConfig* config) {
     return lb;
 }
 
+/*
+ * Tears down whichever of the first `count` worker slots actually finished
+ * pthread_create(), used both when start_load_balancer() fails partway
+ * through and (with count == config->num_cpus) during normal shutdown.
+ */
+static void stop_and_join_workers(LoadBalancer* lb, int count) {
+    for (int i = 0; i < count; i++) {
+        if (lb->workers[i].queue) core_queue_shutdown(lb->workers[i].queue);
+    }
+    for (int i = 0; i < count; i++) {
+        if (lb->workers[i].started) {
+            pthread_join(lb->workers[i].thread, NULL);
+            lb->workers[i].started = 0;
+        }
+    }
+}
+
 int start_load_balancer(LoadBalancer* lb) {
     if (!lb) return -1;
 
-    if (lb->monitor_started || lb->scheduler_started) {
+    if (lb->monitor_started || lb->dispatcher_started) {
         log_message(LOG_WARNING, "Load balancer already started");
         return -1;
     }
 
-    atomic_store(&lb->running, 1);
+    int num_cpus = lb->config->num_cpus;
+    if (num_cpus <= 0) {
+        log_message(LOG_ERROR, "Cannot start with num_cpus = %d", num_cpus);
+        return -1;
+    }
 
-    /* pthread_create returns the error number directly; it does not set errno. */
+    atomic_store(&lb->running, 1);
+    atomic_store(&lb->dispatcher_done, 0);
+
+    lb->workers = calloc((size_t)num_cpus, sizeof(Worker));
+    if (!lb->workers) {
+        log_message(LOG_ERROR, "Out of memory allocating worker pool");
+        atomic_store(&lb->running, 0);
+        return -1;
+    }
+
+    /*
+     * Two passes on purpose. steal_from_peers() and worker_should_exit() read
+     * every worker's `.queue` pointer, including peers' — a worker thread can
+     * start running (via pthread_create below) the instant it is created,
+     * and from that point on those reads race with this thread still writing
+     * `.queue` for workers created later. Finishing every allocation here,
+     * in a pass that creates no threads, guarantees each `.queue` is fully
+     * written before pthread_create() runs for ANY worker; the pthread_create
+     * happens-before edge then makes all of them visible to every worker
+     * thread, not just the ones created before it.
+     */
+    for (int i = 0; i < num_cpus; i++) {
+        Worker* w = &lb->workers[i];
+        w->lb = lb;
+        w->cpu_id = i;
+        w->started = 0;
+        w->tasks_run = 0;
+        w->tasks_stolen_by_me = 0;
+        w->voluntary_ctxt_switches = 0;
+        w->involuntary_ctxt_switches = 0;
+
+        w->queue = init_core_queue();
+        if (!w->queue) {
+            log_message(LOG_ERROR, "Failed to create core queue for CPU %d", i);
+            for (int j = 0; j < i; j++) cleanup_core_queue(lb->workers[j].queue);
+            free(lb->workers);
+            lb->workers = NULL;
+            atomic_store(&lb->running, 0);
+            return -1;
+        }
+    }
+
+    int created = 0;
+    for (int i = 0; i < num_cpus; i++) {
+        Worker* w = &lb->workers[i];
+
+        /* Pin via thread attributes rather than pthread_setaffinity_np()
+         * after creation: the new thread is runnable the instant it is
+         * created, so setting affinity afterwards races with it and the
+         * first scheduling slice can land on the wrong core. */
+        pthread_attr_t attr;
+        cpu_set_t cpuset;
+        pthread_attr_init(&attr);
+        CPU_ZERO(&cpuset);
+        CPU_SET(i, &cpuset);
+        pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
+
+        int rc = pthread_create(&w->thread, &attr, worker_thread_func, w);
+        pthread_attr_destroy(&attr);
+
+        if (rc != 0) {
+            log_message(LOG_ERROR, "Failed to create worker thread for CPU %d: %s",
+                        i, strerror(rc));
+            /* dispatcher_done can be set now: the dispatcher was never
+             * created on this failure path, so it is trivially true that no
+             * further push will ever reach any CoreQueue. */
+            atomic_store(&lb->dispatcher_done, 1);
+            stop_and_join_workers(lb, created);
+            for (int j = 0; j < num_cpus; j++) cleanup_core_queue(lb->workers[j].queue);
+            free(lb->workers);
+            lb->workers = NULL;
+            atomic_store(&lb->running, 0);
+            atomic_store(&lb->dispatcher_done, 0);
+            return -1;
+        }
+
+        w->started = 1;
+        created++;
+    }
+
     int rc = pthread_create(&lb->monitor_thread, NULL, monitor_thread_func, lb);
     if (rc != 0) {
         log_message(LOG_ERROR, "Failed to create monitor thread: %s", strerror(rc));
         atomic_store(&lb->running, 0);
+        atomic_store(&lb->dispatcher_done, 1);
+        stop_and_join_workers(lb, created);
+        for (int j = 0; j < num_cpus; j++) cleanup_core_queue(lb->workers[j].queue);
+        free(lb->workers);
+        lb->workers = NULL;
         return -1;
     }
     lb->monitor_started = 1;
 
-    rc = pthread_create(&lb->scheduler_thread, NULL, scheduler_thread_func, lb);
+    rc = pthread_create(&lb->dispatcher_thread, NULL, dispatcher_thread_func, lb);
     if (rc != 0) {
-        log_message(LOG_ERROR, "Failed to create scheduler thread: %s", strerror(rc));
+        log_message(LOG_ERROR, "Failed to create dispatcher thread: %s", strerror(rc));
         atomic_store(&lb->running, 0);
         pthread_join(lb->monitor_thread, NULL);
-        lb->monitor_started = 0;   /* pthread_t is now stale; never join it again */
+        lb->monitor_started = 0;
+        atomic_store(&lb->dispatcher_done, 1);
+        stop_and_join_workers(lb, created);
+        for (int j = 0; j < num_cpus; j++) cleanup_core_queue(lb->workers[j].queue);
+        free(lb->workers);
+        lb->workers = NULL;
         return -1;
     }
-    lb->scheduler_started = 1;
+    lb->dispatcher_started = 1;
 
-    /* Deliberately not done here: shutting the queue down (it is empty, and
-     * doing so would make the object un-restartable) and waiting for task
-     * threads (none can exist — only the scheduler creates them). Disposal is
-     * cleanup_load_balancer()'s job. */
-
-    log_message(LOG_INFO, "Load balancer started");
+    log_message(LOG_INFO, "Load balancer started: %d worker(s), policy=%s, work_stealing=%s",
+                num_cpus, scheduling_policy_name(lb->config->scheduling_policy),
+                lb->config->enable_work_stealing ? "on" : "off");
     return 0;
 }
 
@@ -288,26 +220,46 @@ void* monitor_thread_func(void* arg) {
     return NULL;
 }
 
-int find_best_cpu(CPUMonitor* monitor) {
-    int best_cpu = -1;
-    double lowest_load = 999.9;
+/* ---------------------------------------------------------------------------
+ * CPU selection
+ * ------------------------------------------------------------------------ */
 
-    /* Read under the monitor lock: these fields are written concurrently by
-     * the monitor thread. */
+static int select_cpu_round_robin(LoadBalancer* lb) {
+    int n = lb->config->num_cpus;
+    if (n <= 0) return -1;
+    /* fetch_add always advances, so distinct callers never see the same
+     * value even if the counter wraps; only the result mod n matters. */
+    unsigned int idx = (unsigned int)atomic_fetch_add(&lb->rr_cursor, 1);
+    return (int)(idx % (unsigned int)n);
+}
+
+/*
+ * Shared scoring loop for LEAST_LOAD and PREDICTIVE: both blend measured
+ * usage with a bias toward cores that already have work either running or
+ * queued; PREDICTIVE additionally blends in the moving-average prediction.
+ *
+ * The `active_tasks * 10` term compensates for /proc/stat lagging by up to
+ * one monitoring interval, so a core just handed work still looks idle. The
+ * queue-depth term is the analogous compensation for the *dispatcher*: a
+ * burst of submissions should spread across queues, not stack up behind one
+ * core just because that core's current_usage hasn't risen yet.
+ */
+static int select_cpu_scored(LoadBalancer* lb, int use_prediction) {
+    CPUMonitor* monitor = lb->cpu_monitor;
+    int best_cpu = -1;
+    double lowest_load = 1e18;
+
     pthread_mutex_lock(&monitor->lock);
 
     for (int i = 0; i < monitor->num_cpus; i++) {
         double effective_load = monitor->stats[i].current_usage;
 
-        if (monitor->config->enable_load_prediction) {
+        if (use_prediction && monitor->config->enable_load_prediction) {
             effective_load = (effective_load + monitor->stats[i].predicted_load) / 2;
         }
 
-        /* Bias against cores that already have work in flight. The measured
-         * usage from /proc/stat lags by up to one monitoring interval, so a
-         * core that was just handed a task still looks idle; this term stops
-         * a burst of submissions all landing on the same core. */
         effective_load += (monitor->stats[i].active_tasks * 10);
+        effective_load += (core_queue_size(lb->workers[i].queue) * 5);
 
         if (effective_load < lowest_load) {
             lowest_load = effective_load;
@@ -319,6 +271,24 @@ int find_best_cpu(CPUMonitor* monitor) {
 
     return best_cpu;
 }
+
+int select_cpu(LoadBalancer* lb) {
+    if (!lb || lb->config->num_cpus <= 0) return -1;
+
+    switch (lb->config->scheduling_policy) {
+        case SCHED_ROUND_ROBIN:
+            return select_cpu_round_robin(lb);
+        case SCHED_LEAST_LOAD:
+            return select_cpu_scored(lb, 0);
+        case SCHED_PREDICTIVE:
+        default:
+            return select_cpu_scored(lb, 1);
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Submission and execution
+ * ------------------------------------------------------------------------ */
 
 int submit_task(LoadBalancer* lb, void (*function)(void*), void* args,
                 TaskArgsDestructor args_free, TaskPriority priority) {
@@ -345,38 +315,135 @@ int submit_task(LoadBalancer* lb, void (*function)(void*), void* args,
     return 0;
 }
 
-/* Wrapper for task execution */
-static void* task_wrapper(void* arg) {
-    TaskRun* run = (TaskRun*)arg;
-    Task* task = run->task;
-    LoadBalancer* lb = run->lb;
+/* Runs one task to completion on the calling worker thread. `w` need not be
+ * the core the dispatcher originally chose: when the task arrived via a
+ * steal, w->cpu_id is where it actually ends up executing, and task-
+ * >assigned_cpu is set to match — that is the task migration this pool
+ * exists to enable. */
+static void run_task(LoadBalancer* lb, Worker* w, Task* task) {
+    task->assigned_cpu = w->cpu_id;
+    task->status = STATUS_RUNNING;
+    clock_gettime(CLOCK_MONOTONIC, &task->start_time);
+
+    cpu_monitor_adjust_active_tasks(lb->cpu_monitor, w->cpu_id, +1);
+    atomic_fetch_add(&lb->tasks_in_flight, 1);
 
     task->function(task->args);
 
     task->status = STATUS_COMPLETED;
     clock_gettime(CLOCK_MONOTONIC, &task->end_time);
-
     task->cpu_usage = (task->end_time.tv_sec - task->start_time.tv_sec) +
                       (task->end_time.tv_nsec - task->start_time.tv_nsec) / 1e9;
 
-    /* Release the core's slot. The original code incremented this counter and
-     * never decremented it, so find_best_cpu()'s bias term grew without bound
-     * and the placement decision drifted away from reality. */
-    cpu_monitor_adjust_active_tasks(lb->cpu_monitor, task->assigned_cpu, -1);
+    cpu_monitor_adjust_active_tasks(lb->cpu_monitor, w->cpu_id, -1);
+    atomic_fetch_sub(&lb->tasks_in_flight, 1);
+    w->tasks_run++;
 
-    /* free_task() runs the caller's args destructor, which is arbitrary code
-     * that may log or touch balancer state. It must therefore run BEFORE the
-     * thread is reported finished, while the join still protects it. */
-    run->task = NULL;
+    log_message(LOG_INFO, "Task %d completed on CPU %d in %.3fs",
+                task->task_id, w->cpu_id, task->cpu_usage);
+
+    /* Give the hook a look at the finished task, including timestamps and
+     * final assigned_cpu, before it is freed. */
+    if (lb->config->on_task_complete) {
+        lb->config->on_task_complete(task, lb->config->on_task_complete_user_data);
+    }
+
     free_task(task);
+}
 
-    /* Last statement. `run` now belongs to whoever reaps it; the reaper frees
-     * it after pthread_join returns. Nothing may follow this call. */
-    registry_finish(&lb->task_threads, run);
+/*
+ * Looks for the peer with the deepest queue and, if it has more than one
+ * task queued, steals one. Scanning for the *most* loaded peer (rather than
+ * the first non-empty one) is what makes stealing target an overloaded core
+ * specifically, instead of just whichever core happened to be checked first.
+ */
+static Task* steal_from_peers(LoadBalancer* lb, Worker* self) {
+    int n = lb->config->num_cpus;
+    int victim = -1;
+    int victim_depth = 1;   /* core_queue_try_steal already refuses <= 1 */
+
+    for (int i = 0; i < n; i++) {
+        if (i == self->cpu_id) continue;
+        int depth = core_queue_size(lb->workers[i].queue);
+        if (depth > victim_depth) {
+            victim_depth = depth;
+            victim = i;
+        }
+    }
+
+    if (victim < 0) return NULL;
+
+    Task* task = core_queue_try_steal(lb->workers[victim].queue);
+    if (task) {
+        self->tasks_stolen_by_me++;
+        log_message(LOG_DEBUG, "CPU %d stole task %d from CPU %d",
+                    self->cpu_id, task->task_id, victim);
+    }
+    return task;
+}
+
+/*
+ * True only once it is certain no task will ever reach this worker again:
+ * the pool is stopping, the dispatcher has been joined (so nothing new can
+ * be pushed to any CoreQueue), and every CoreQueue — this one and every
+ * peer's — is observed empty.
+ *
+ * That last scan is safe without a global counter because, once
+ * dispatcher_done is set, the total task count across every CoreQueue is
+ * monotonically non-increasing: nothing can push again, so anything this
+ * function sees as empty stays empty. A peer transiently non-empty just
+ * means "not yet" — the loop that calls this tries again next iteration.
+ */
+static int worker_should_exit(LoadBalancer* lb) {
+    if (atomic_load(&lb->running)) return 0;
+    if (!atomic_load(&lb->dispatcher_done)) return 0;
+
+    for (int i = 0; i < lb->config->num_cpus; i++) {
+        if (core_queue_size(lb->workers[i].queue) > 0) return 0;
+    }
+    return 1;
+}
+
+static void record_thread_rusage(Worker* w) {
+    struct rusage usage;
+    if (getrusage(RUSAGE_THREAD, &usage) == 0) {
+        w->voluntary_ctxt_switches = usage.ru_nvcsw;
+        w->involuntary_ctxt_switches = usage.ru_nivcsw;
+    }
+}
+
+void* worker_thread_func(void* arg) {
+    Worker* w = (Worker*)arg;
+    LoadBalancer* lb = w->lb;
+    sigset_t set;
+
+    /* Block SIGINT here too: with a fixed pool instead of per-task threads,
+     * these are now long-lived, and the same reasoning applies — the signal
+     * must always be delivered to main, never to a worker. */
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
+    for (;;) {
+        Task* task = core_queue_pop_own(w->queue, WORKER_POLL_MS);
+
+        if (!task && lb->config->enable_work_stealing) {
+            task = steal_from_peers(lb, w);
+        }
+
+        if (task) {
+            run_task(lb, w, task);
+            continue;
+        }
+
+        if (worker_should_exit(lb)) break;
+    }
+
+    record_thread_rusage(w);
     return NULL;
 }
 
-void* scheduler_thread_func(void* arg) {
+void* dispatcher_thread_func(void* arg) {
     LoadBalancer* lb = (LoadBalancer*)arg;
     sigset_t set;
 
@@ -386,10 +453,6 @@ void* scheduler_thread_func(void* arg) {
     pthread_sigmask(SIG_BLOCK, &set, NULL);
 
     for (;;) {
-        /* Reclaim finished threads as we go, so a long run does not
-         * accumulate unjoined stacks. */
-        registry_reap(&lb->task_threads);
-
         /* Returns NULL only once the queue is shut down and drained, which is
          * this loop's exit condition. */
         Task* task = dequeue_task(lb->task_queue);
@@ -401,64 +464,26 @@ void* scheduler_thread_func(void* arg) {
             continue;
         }
 
-        int cpu_id = find_best_cpu(lb->cpu_monitor);
+        int cpu_id = select_cpu(lb);
         if (cpu_id < 0) {
             log_message(LOG_WARNING, "No CPU available for task %d", task->task_id);
-            free_task(task);
-            continue;
-        }
-
-        TaskRun* run = malloc(sizeof(TaskRun));
-        if (!run) {
-            log_message(LOG_ERROR, "Out of memory scheduling task %d", task->task_id);
-            free_task(task);
-            continue;
-        }
-        run->next = NULL;
-        run->lb = lb;
-        run->task = task;
-
-        /* Pin via the thread attributes rather than calling
-         * pthread_setaffinity_np() after pthread_create(): the new thread is
-         * runnable the instant it is created, so setting affinity afterwards
-         * races with it and the first slice can land on the wrong core.
-         *
-         * Note there is no PTHREAD_CREATE_DETACHED here: shutdown joins these
-         * threads, and joining a detached thread is undefined. */
-        pthread_attr_t attr;
-        cpu_set_t cpuset;
-
-        pthread_attr_init(&attr);
-        CPU_ZERO(&cpuset);
-        CPU_SET(cpu_id, &cpuset);
-        pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpuset);
-
-        task->assigned_cpu = cpu_id;
-        task->status = STATUS_RUNNING;
-        clock_gettime(CLOCK_MONOTONIC, &task->start_time);
-
-        cpu_monitor_adjust_active_tasks(lb->cpu_monitor, cpu_id, +1);
-
-        int rc = registry_spawn(&lb->task_threads, &attr, task_wrapper, run);
-        pthread_attr_destroy(&attr);
-
-        if (rc != 0) {
-            if (rc == ECANCELED) {
-                log_message(LOG_INFO, "Shutting down; dropping task %d",
-                            task->task_id);
-            } else {
-                log_message(LOG_ERROR, "Failed to create thread for task %d: %s",
-                            task->task_id, strerror(rc));
-            }
-            /* Nothing was registered, so there is no registry state to undo. */
-            cpu_monitor_adjust_active_tasks(lb->cpu_monitor, cpu_id, -1);
             task->status = STATUS_FAILED;
-            free(run);
             free_task(task);
             continue;
         }
 
-        log_message(LOG_INFO, "Task %d (priority %d) assigned to CPU %d",
+        task->assigned_cpu = cpu_id;   /* provisional: may be re-set if stolen */
+
+        if (core_queue_push(lb->workers[cpu_id].queue, task) != 0) {
+            /* Only reachable if that core's queue was shut down concurrently,
+             * which only happens once running is already false. */
+            log_message(LOG_INFO, "Shutting down; dropping task %d", task->task_id);
+            task->status = STATUS_FAILED;
+            free_task(task);
+            continue;
+        }
+
+        log_message(LOG_INFO, "Task %d (priority %d) dispatched to CPU %d",
                     task->task_id, task->priority, cpu_id);
     }
 
@@ -467,23 +492,52 @@ void* scheduler_thread_func(void* arg) {
 
 int load_balancer_active_tasks(LoadBalancer* lb) {
     if (!lb) return 0;
-    return registry_live(&lb->task_threads);
+    return atomic_load(&lb->tasks_in_flight);
+}
+
+int load_balancer_pending_tasks(LoadBalancer* lb) {
+    if (!lb) return 0;
+
+    int pending = task_queue_size(lb->task_queue);
+    if (lb->workers) {
+        for (int i = 0; i < lb->config->num_cpus; i++) {
+            pending += core_queue_size(lb->workers[i].queue);
+        }
+    }
+    return pending;
+}
+
+int load_balancer_worker_stats(LoadBalancer* lb, int cpu_id, WorkerStats* out) {
+    if (!lb || !out || !lb->workers) return -1;
+    if (cpu_id < 0 || cpu_id >= lb->config->num_cpus) return -1;
+
+    Worker* w = &lb->workers[cpu_id];
+    out->cpu_id = w->cpu_id;
+    out->tasks_run = w->tasks_run;
+    out->tasks_stolen_by_me = w->tasks_stolen_by_me;
+    out->tasks_stolen_from_me = w->queue ? w->queue->stolen_total : 0;
+    out->voluntary_ctxt_switches = w->voluntary_ctxt_switches;
+    out->involuntary_ctxt_switches = w->involuntary_ctxt_switches;
+    return 0;
 }
 
 void wait_for_tasks_completion(LoadBalancer* lb) {
     if (!lb) return;
-    registry_join_all(&lb->task_threads);
+
+    while (load_balancer_pending_tasks(lb) > 0 || load_balancer_active_tasks(lb) > 0) {
+        usleep(50000);
+    }
 }
 
 void cancel_pending_tasks(LoadBalancer* lb) {
     if (!lb) return;
 
-    /* Delegates to the queue, which pops through an internal helper while
-     * holding its own mutex. The previous version locked the queue mutex here
-     * and then called dequeue_task(), which locks the same non-recursive
-     * mutex a second time — an unconditional self-deadlock whenever any task
-     * was still pending. */
     int dropped = drain_task_queue(lb->task_queue);
+    if (lb->workers) {
+        for (int i = 0; i < lb->config->num_cpus; i++) {
+            dropped += core_queue_drain(lb->workers[i].queue);
+        }
+    }
     if (dropped > 0) {
         log_message(LOG_INFO, "Cancelled %d pending task(s)", dropped);
     }
@@ -495,14 +549,24 @@ void stop_load_balancer(LoadBalancer* lb) {
     if (atomic_exchange(&lb->running, 0) != 0) {
         log_message(LOG_INFO, "Initiating load balancer shutdown");
 
-        /* Unblocks the scheduler thread parked in dequeue_task(). */
+        /* Unblocks the dispatcher thread parked in dequeue_task(). Every task
+         * still in the admission queue at this point gets marked FAILED by
+         * the dispatcher's `!running` check above, not dispatched further. */
         shutdown_task_queue(lb->task_queue);
 
-        /* Scheduler first — it is the one blocked on the queue. */
-        if (lb->scheduler_started) {
-            pthread_join(lb->scheduler_thread, NULL);
-            lb->scheduler_started = 0;
+        if (lb->dispatcher_started) {
+            pthread_join(lb->dispatcher_thread, NULL);
+            lb->dispatcher_started = 0;
         }
+
+        /* Only valid once the dispatcher is truly gone: this is the signal
+         * workers use to know no CoreQueue will ever be pushed to again. */
+        atomic_store(&lb->dispatcher_done, 1);
+
+        if (lb->workers) {
+            stop_and_join_workers(lb, lb->config->num_cpus);
+        }
+
         if (lb->monitor_started) {
             pthread_join(lb->monitor_thread, NULL);
             lb->monitor_started = 0;
@@ -510,16 +574,13 @@ void stop_load_balancer(LoadBalancer* lb) {
 
         cancel_pending_tasks(lb);
     } else {
-        /* Never started, or already stopped: still make the queue safe. */
+        /* Never started, or already stopped: still make every queue safe to
+         * free. Workers, if any exist, were already joined by the branch
+         * above on the call that actually flipped `running` to 0. */
         shutdown_task_queue(lb->task_queue);
+        atomic_store(&lb->dispatcher_done, 1);
+        cancel_pending_tasks(lb);
     }
-
-    /* Outside the guard above on purpose. cleanup_load_balancer() calls this
-     * function; if a caller already stopped us, an early return here would
-     * skip the join and let cleanup destroy the registry while task threads
-     * were still using it. Joining twice is a no-op. */
-    registry_close(&lb->task_threads);
-    registry_join_all(&lb->task_threads);
 
     log_message(LOG_INFO, "Load balancer stopped successfully");
 }
@@ -529,9 +590,13 @@ void cleanup_load_balancer(LoadBalancer* lb) {
 
     stop_load_balancer(lb);
 
-    /* Belt and braces: stop_load_balancer() always joins, but this makes the
-     * precondition for registry_destroy() explicit at the point it matters. */
-    registry_join_all(&lb->task_threads);
+    if (lb->workers) {
+        for (int i = 0; i < lb->config->num_cpus; i++) {
+            cleanup_core_queue(lb->workers[i].queue);
+        }
+        free(lb->workers);
+        lb->workers = NULL;
+    }
 
     cleanup_cpu_monitor(lb->cpu_monitor);
     cleanup_task_queue(lb->task_queue);
@@ -539,8 +604,6 @@ void cleanup_load_balancer(LoadBalancer* lb) {
     lb->cpu_monitor = NULL;
     lb->task_queue = NULL;
     lb->config = NULL;   /* owned by the caller, freed via free_config() */
-
-    registry_destroy(&lb->task_threads);
 
     free(lb);
 }

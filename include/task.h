@@ -25,7 +25,7 @@ typedef enum {
  */
 typedef void (*TaskArgsDestructor)(void* args);
 
-typedef struct {
+typedef struct Task {
     int task_id;
     TaskPriority priority;
     void (*function)(void*);
