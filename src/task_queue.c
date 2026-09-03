@@ -138,10 +138,9 @@ int drain_task_queue(TaskQueue* queue) {
     Task* task;
     while ((task = pop_highest_priority_locked(queue)) != NULL) {
         task->status = STATUS_FAILED;
-        /* Tasks submitted via submit_task() own a single heap block as args;
-         * the runner frees it on the success path, so the cancel path must
-         * free it too or it leaks. */
-        free(task->args);
+        /* free_task() runs each task's args destructor. The library owns args
+         * on every path, so there is nothing to free by hand here — and no
+         * assumption that args is a single malloc'd block. */
         free_task(task);
         dropped++;
     }
