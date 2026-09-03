@@ -474,17 +474,24 @@ void* dispatcher_thread_func(void* arg) {
 
         task->assigned_cpu = cpu_id;   /* provisional: may be re-set if stolen */
 
+        /* Captured before the push: once core_queue_push() succeeds, the
+         * task is visible to its worker (and to any thief), which can pop,
+         * run, and free it before this loop reaches the log call below —
+         * `task` itself is not safe to dereference past a successful push. */
+        int task_id = task->task_id;
+        TaskPriority priority = task->priority;
+
         if (core_queue_push(lb->workers[cpu_id].queue, task) != 0) {
             /* Only reachable if that core's queue was shut down concurrently,
              * which only happens once running is already false. */
-            log_message(LOG_INFO, "Shutting down; dropping task %d", task->task_id);
+            log_message(LOG_INFO, "Shutting down; dropping task %d", task_id);
             task->status = STATUS_FAILED;
             free_task(task);
             continue;
         }
 
         log_message(LOG_INFO, "Task %d (priority %d) dispatched to CPU %d",
-                    task->task_id, task->priority, cpu_id);
+                    task_id, priority, cpu_id);
     }
 
     return NULL;

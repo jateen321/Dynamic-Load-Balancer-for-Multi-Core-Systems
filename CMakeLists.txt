@@ -59,6 +59,28 @@ target_link_libraries(cpu_balancer PRIVATE cpu_balancer_core)
 add_executable(cpu_balancer_bench src/benchmark.c)
 target_link_libraries(cpu_balancer_bench PRIVATE cpu_balancer_core)
 
+# Tests: one small, focused binary per concern rather than one monolithic
+# runner, so `ctest --output-on-failure` points straight at which concern
+# broke instead of just "the test suite failed".
+enable_testing()
+
+set(TEST_SOURCES
+    tests/test_task_queue_priority.c
+    tests/test_task_queue_capacity.c
+    tests/test_core_queue.c
+    tests/test_select_cpu.c
+    tests/test_task_ownership.c
+    tests/test_shutdown.c
+    tests/test_concurrent_producers.c
+)
+
+foreach(test_src ${TEST_SOURCES})
+    get_filename_component(test_name ${test_src} NAME_WE)
+    add_executable(${test_name} ${test_src})
+    target_link_libraries(${test_name} PRIVATE cpu_balancer_core)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()
+
 # Installation rules
 install(TARGETS cpu_balancer cpu_balancer_bench
     RUNTIME DESTINATION bin

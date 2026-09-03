@@ -1,5 +1,7 @@
 # CPU Load Balancer
 
+[![CI](https://github.com/jateen321/Dynamic-Load-Balancer-for-Multi-Core-Systems/actions/workflows/ci.yml/badge.svg)](https://github.com/jateen321/Dynamic-Load-Balancer-for-Multi-Core-Systems/actions/workflows/ci.yml)
+
 A userspace load balancer that distributes CPU-bound tasks across a fixed pool
 of pinned worker threads, one per core. A dispatcher thread reads a global
 priority queue and hands each task to a target core chosen by one of three
@@ -20,9 +22,11 @@ protocol, work stealing, and the scheduling policies.
 4. [Configuration](#configuration)
 5. [Core Features](#core-features)
 6. [Benchmark Suite](#benchmark-suite)
-7. [Building](#building)
-8. [Verification](#verification)
-9. [Known Limitations](#known-limitations)
+7. [Testing](#testing)
+8. [Building](#building)
+9. [Continuous Integration](#continuous-integration)
+10. [Verification](#verification)
+11. [Known Limitations](#known-limitations)
 
 ## Quick Start
 
@@ -48,10 +52,13 @@ File structure:
 
 ```
 .
+├── .github
+│   └── workflows
+│       └── ci.yml            # build -> unit tests -> ASan/UBSan -> ThreadSanitizer
 ├── CMakeLists.txt
 ├── Makefile
 ├── config
-│   └── cpu_balancer.conf     # template for the not-yet-implemented parser
+│   └── cpu_balancer.conf     # parsed by load_config()
 ├── docs
 │   └── LEARNING_GUIDE.md     # OS concepts behind each part of the code
 ├── include
@@ -62,15 +69,24 @@ File structure:
 │   ├── task.h
 │   └── task_queue.h
 ├── README.md
-└── src
-    ├── benchmark.c
-    ├── config.c
-    ├── cpu_stats.c
-    ├── load_balancer.c
-    ├── logger.c
-    ├── main.c
-    ├── task.c
-    └── task_queue.c
+├── src
+│   ├── benchmark.c
+│   ├── config.c
+│   ├── cpu_stats.c
+│   ├── load_balancer.c
+│   ├── logger.c
+│   ├── main.c
+│   ├── task.c
+│   └── task_queue.c
+└── tests
+    ├── test_common.h
+    ├── test_concurrent_producers.c
+    ├── test_core_queue.c
+    ├── test_select_cpu.c
+    ├── test_shutdown.c
+    ├── test_task_ownership.c
+    ├── test_task_queue_capacity.c
+    └── test_task_queue_priority.c
 ```
 
 ### Key Features
@@ -279,6 +295,15 @@ Task IDs come from `__atomic_fetch_add(..., __ATOMIC_SEQ_CST)`.
 
 ## Configuration
 
+`init_default_config()` returns the defaults below. `load_config(path)` reads
+`config/cpu_balancer.conf`-style JSON — a flat, one-level object — and starts
+from those same defaults, overriding only the keys actually present in the
+file; a missing/unreadable/malformed file, or a key with the wrong type, logs
+a warning and falls back to the default for whatever it couldn't use, never
+failing outright. `num_cpus` isn't file-configurable: `main()` always sets it
+from argv after loading a config, so a value in the file is accepted but
+ignored.
+
 ```c
 LoadBalancerConfig* init_default_config(void) {
     LoadBalancerConfig* config = malloc(sizeof(LoadBalancerConfig));
@@ -441,6 +466,48 @@ attributable to the benchmark's own tasks, especially on a shared or
 virtualised machine. Busy time attributed by `assigned_cpu` is exact and
 reproducible instead.
 
+## Testing
+
+`tests/` holds one small, focused binary per concern rather than one
+monolithic runner, wired into CMake via CTest — no external test framework, in
+keeping with the project's pthread/m/rt-only dependency footprint. Each file
+is a plain `main()` using a `CHECK()` macro (`tests/test_common.h`) rather than
+`assert()`, since CMake's default Release flags define `NDEBUG`, which would
+silently no-op a plain `assert()` under exactly the build CTest runs by
+default.
+
+```bash
+cmake -S . -B build && cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+| Test | Covers |
+|---|---|
+| `test_task_queue_priority` | Global admission queue: highest-priority-first, FIFO within a level |
+| `test_task_queue_capacity` | A blocked producer on a full queue unblocks on either free space or shutdown |
+| `test_core_queue` | Per-core queue FIFO from the owner; `try_steal` refuses at count ≤ 1 and takes the tail above it; concurrent push/pop/steal loses nothing |
+| `test_select_cpu` | All three `SchedulingPolicy` values, white-box against `cpu_monitor->stats` — round robin's cycle order, least-load's and predictive's scoring (including the active-tasks and queue-depth terms, the blended average, and the `enable_load_prediction=0` fallback) |
+| `test_task_ownership` | `submit_task`'s destructor-exactly-once contract across success, rejection, and cancellation at shutdown |
+| `test_shutdown` | Nothing left pending/active after `stop_load_balancer`; safe to call twice; NULL-`lb` safety |
+| `test_concurrent_producers` | Multiple threads racing `enqueue_task`/`submit_task` lose or duplicate nothing |
+
+Most tests run through the public API only; `test_select_cpu` is white-box —
+`LoadBalancer`, `CPUMonitor`, `TaskQueue`, and `CoreQueue` are all fully
+defined (not opaque) in their headers, so writing directly into
+`lb->cpu_monitor->stats[i]` under its lock is how a deterministic scoring
+scenario gets built without depending on real `/proc/stat` numbers.
+
+The test suite is what actually caught this project's one confirmed
+concurrency bug outside the sanitizer runs already covered above: three
+`log_message()` calls (in `enqueue_task`, `core_queue_push`, and the
+dispatcher) used to read `task->task_id`/`task->priority` *after* the task
+had already been unlocked and handed to a consumer that could pop, run, and
+free it first — a real, ASan-reproducible use-after-free once a worker pool
+can pick up and finish a task within microseconds of it being queued. Fixed
+by capturing those fields into locals before the task becomes visible to
+anyone else. `test_shutdown` and `test_concurrent_producers` are what
+exercise this path.
+
 ## Building
 
 ### Prerequisites
@@ -455,13 +522,29 @@ reproducible instead.
 make                 # or: cmake -S . -B build && cmake --build build
 make clean
 make bench           # builds and runs the policy comparison
-make tsan            # ThreadSanitizer build (both executables)
-make asan            # AddressSanitizer + UBSan build (both executables)
+make tsan            # ThreadSanitizer build (all executables, incl. tests)
+make asan            # AddressSanitizer + UBSan build (all executables, incl. tests)
 ```
 
-`cmake` produces a static library, `cpu_balancer_core`, linked into both
-`cpu_balancer` (`src/main.c`) and `cpu_balancer_bench` (`src/benchmark.c`);
-`cmake --install` installs both binaries.
+`cmake` produces a static library, `cpu_balancer_core`, linked into
+`cpu_balancer` (`src/main.c`), `cpu_balancer_bench` (`src/benchmark.c`), and
+every `tests/test_*` binary; `cmake --install` installs the two main
+executables.
+
+## Continuous Integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, one sequential
+job so a failure at any stage stops the pipeline there:
+
+```
+build  →  unit tests  →  ASan / UBSan  →  ThreadSanitizer
+```
+
+Each stage after the first re-runs `ctest --test-dir <dir> --output-on-failure`
+against a fresh configure/build of that stage's variant — the sanitizer stages
+use the exact same `-fsanitize=...` flags as the `make tsan`/`make asan`
+Makefile targets, so a local `make tsan`/`make asan` run reproduces what CI
+checks.
 
 ## Verification
 
@@ -469,12 +552,15 @@ Checked on a 4-core Linux box, GCC 13.3:
 
 | Check | Result |
 |---|---|
-| `-Wall -Wextra -Wpedantic` | 0 warnings (both executables) |
+| `-Wall -Wextra -Wpedantic` | 0 warnings (all executables, incl. tests) |
 | Normal run to completion, all 3 policies | exit 0 |
 | `SIGINT` mid-run, all 3 policies | graceful, time spent waiting for in-flight tasks |
 | Work stealing observed in normal operation | `tasks_stolen_by_me` > 0 in representative runs |
-| ThreadSanitizer, normal path, all 3 policies | 0 data races |
-| ThreadSanitizer, `SIGINT` path | 0 data races |
+| `ctest`, Release build | 7/7 tests pass |
+| `ctest`, ThreadSanitizer build | 7/7 tests pass, 0 data races, stable across repeated runs |
+| `ctest`, ASan/UBSan build | 7/7 tests pass, 0 errors, 0 leaks, stable across repeated runs |
+| ThreadSanitizer, `cpu_balancer` normal path, all 3 policies | 0 data races |
+| ThreadSanitizer, `cpu_balancer` `SIGINT` path | 0 data races |
 | ThreadSanitizer, `cpu_balancer_bench` (concurrent `on_task_complete` hook) | 0 data races |
 | Valgrind, normal path | `All heap blocks were freed`, 0 errors |
 | Valgrind, `SIGINT` path | `All heap blocks were freed`, 0 errors |
@@ -482,6 +568,7 @@ Checked on a 4-core Linux box, GCC 13.3:
 | ASan: task outliving shutdown | no use-after-free; cleanup blocks until joined |
 | ASan: multi-block args cancelled at shutdown | destroyed exactly once, 0 leaks |
 | ASan: non-owned args, `NULL` destructor | never freed |
+| ASan: `load_config()` against adversarial fixtures | 0 errors, 0 leaks (malformed JSON, huge numbers, truncated input, wrong types) |
 | Priority queue ordering + FIFO within level (admission queue) | pass |
 | `cpu_balancer_bench` output sanity (multiple core/task/seed combinations) | no NaN, plausible ranges |
 
@@ -489,9 +576,6 @@ Checked on a 4-core Linux box, GCC 13.3:
 
 Stated explicitly rather than implied by omission:
 
-- **`load_config()` is a stub.** It ignores the path and returns the defaults.
-  `config/cpu_balancer.conf` is a template for the parser that would consume
-  it; no configuration file is actually read.
 - **Migration only ever moves a task that hasn't started running yet.** Work
   stealing takes tasks off a peer's *queue*; a task already executing on a
   core stays there until it finishes — there is no mechanism (and none is
@@ -505,8 +589,12 @@ Stated explicitly rather than implied by omission:
   concurrent ones.** Two threads calling it at once is not supported.
 - **`CPUStats::temperature` is never populated.** The field exists; nothing
   reads a thermal zone.
-- **No unit test suite in-tree.** Correctness was checked with the sanitizers
-  and Valgrind runs above.
+- **`load_config()`'s parser is intentionally minimal.** It handles the flat,
+  one-level object this project's config format actually uses (see
+  [Configuration](#configuration)); it is not a general JSON parser and
+  doesn't try to be one — nested objects/arrays under an unknown key are
+  skipped rather than rejected, but a known key given one is a type mismatch
+  (falls back to that field's default).
 - **Linux-only.**
 
 See `docs/LEARNING_GUIDE.md` for the operating-systems concepts behind each

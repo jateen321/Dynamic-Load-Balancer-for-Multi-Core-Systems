@@ -75,6 +75,11 @@ int enqueue_task(TaskQueue* queue, Task* task) {
 
     int p = clamp_priority(task->priority);
     PriorityBucket* bucket = &queue->buckets[p];
+    /* Captured before the task becomes visible to a consumer: once unlocked
+     * below, a waiting dequeue_task() can pop, run, and free this exact task
+     * before this function's next line runs, so `task` itself is no longer
+     * safe to dereference past the unlock. */
+    int task_id = task->task_id;
 
     bucket->rear = (bucket->rear + 1) % queue->capacity;
     bucket->slots[bucket->rear] = task;
@@ -84,7 +89,7 @@ int enqueue_task(TaskQueue* queue, Task* task) {
     pthread_cond_signal(&queue->not_empty);
     pthread_mutex_unlock(&queue->mutex);
 
-    log_message(LOG_DEBUG, "Task %d enqueued at priority %d", task->task_id, p);
+    log_message(LOG_DEBUG, "Task %d enqueued at priority %d", task_id, p);
     return 0;
 }
 
@@ -217,6 +222,11 @@ int core_queue_push(CoreQueue* queue, Task* task) {
     if (!node) return -1;
     node->task = task;
     node->next = NULL;
+    /* Captured before the task becomes visible to its owning worker: once
+     * unlocked below, that worker can pop, run, and free this exact task
+     * before this function's log call runs, so `task` itself is no longer
+     * safe to dereference past the unlock. */
+    int task_id = task->task_id;
 
     pthread_mutex_lock(&queue->lock);
 
@@ -239,7 +249,7 @@ int core_queue_push(CoreQueue* queue, Task* task) {
     pthread_cond_signal(&queue->not_empty);
     pthread_mutex_unlock(&queue->lock);
 
-    log_message(LOG_DEBUG, "Task %d pushed to core queue", task->task_id);
+    log_message(LOG_DEBUG, "Task %d pushed to core queue", task_id);
     return 0;
 }
 
