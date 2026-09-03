@@ -6,19 +6,31 @@ cost function that blends measured load, a moving-average prediction, and the
 number of tasks already in flight, then pins each task's thread to that core
 with `pthread_setaffinity_np`.
 
-Written as an operating-systems project: the interesting parts are the
-concurrency primitives (mutexes, condition variables, atomics), the shutdown
-protocol, and the scheduling policy.
+## Scope
+
+**This is a scheduler simulation for learning, not a production tool.** The
+Linux kernel already does this job, and does it better — see
+[Why not just use the kernel scheduler?](#why-not-just-use-the-kernel-scheduler)
+for the measured reasons why. Nothing here is intended to make a real workload
+faster, and it should not be deployed expecting that.
+
+What it *is* good for: a working model of how a scheduler makes placement
+decisions, built out of the real primitives — mutexes, condition variables,
+atomics, a bounded producer–consumer queue, a multi-level priority queue,
+join-based thread lifetime, and CPU affinity. Those concepts are all genuine;
+it is their composition into a userspace load balancer that would not ship.
 
 ## Table of Contents
 1. [Quick Start](#quick-start)
-2. [Architecture](#architecture)
-3. [Components](#components)
-4. [Configuration](#configuration)
-5. [Core Features](#core-features)
-6. [Building](#building)
-7. [Verification](#verification)
-8. [Known Limitations](#known-limitations)
+2. [Why not just use the kernel scheduler?](#why-not-just-use-the-kernel-scheduler)
+3. [Architecture](#architecture)
+4. [Components](#components)
+5. [Configuration](#configuration)
+6. [Core Features](#core-features)
+7. [Building](#building)
+8. [Verification](#verification)
+9. [Known Limitations](#known-limitations)
+10. [Roadmap](#roadmap)
 
 ## Quick Start
 
@@ -66,15 +78,59 @@ File structure:
     └── task_queue.c
 ```
 
-### Key Features
+### What it implements
 - Dynamic task distribution across multiple CPU cores
 - Real-time CPU load monitoring from `/proc/stat`
 - Priority-based task scheduling (4-level multi-level queue)
 - Moving-average load prediction
 - CPU affinity pinning, applied before a task thread first runs
+- Explicit task-argument ownership via a destructor callback
+- Join-based task thread lifetime — no detached threads, no shutdown timeout
 - Configurable load thresholds and monitoring interval
-- Thread-safe logging
+- Thread-safe logging with a stderr fallback
 - Graceful shutdown on `SIGINT`
+
+## Why not just use the kernel scheduler?
+
+Because you should. This section exists so the project does not quietly imply
+otherwise.
+
+Linux (CFS, and EEVDF since 6.6) solves the same problem with advantages this
+program structurally cannot obtain:
+
+| | This project | Kernel scheduler |
+|---|---|---|
+| Load signal | `/proc/stat`, up to one interval stale | Live runqueue lengths |
+| Core goes hot after placement | Nothing happens | Migrates the task |
+| Core goes idle | Nothing happens | Work stealing, in microseconds |
+| Cache / NUMA topology | Unaware | Scheduling domains |
+| Decision cost | Two syscalls plus a scan | Nanoseconds, already in the path |
+
+The deeper problem is not accuracy, it is that **pinning disables the mechanism
+that would have corrected a bad decision.** Setting an affinity mask tells the
+kernel it may not migrate that thread. So the program removes a good dynamic
+scheduler and substitutes a worse one working from stale data — and when the
+placement turns out wrong, the task is stuck there for its whole runtime.
+
+The `active_tasks * 10` term in `find_best_cpu` is the tell. That constant
+exists only to compensate for measurement lag: a core handed a task a moment
+ago still looks idle in `/proc/stat`. The kernel needs no such fudge because it
+is not guessing.
+
+### Where userspace pinning is genuinely used
+
+Pinning is a real technique — but always in a form this project does not use:
+
+- **HPC** — pinning MPI ranks and OpenMP threads for NUMA locality (`numactl`,
+  `hwloc`, `OMP_PROC_BIND`)
+- **Low-latency trading** — `isolcpus` + `nohz_full`, one hot thread per
+  isolated core
+- **Thread-per-core databases** — Seastar, ScyllaDB, Redis
+- **Kubernetes CPU Manager** — exclusive cpusets for latency-sensitive pods
+
+The pattern is the same in every case: *static, topology-aware* pinning, used to
+eliminate scheduler interference. None of them measure load and place
+dynamically, because that is precisely what the kernel already does better.
 
 ## Architecture
 
@@ -361,6 +417,67 @@ Stated explicitly rather than implied by omission:
 - **No unit test suite in-tree.** Correctness was checked with the sanitizers
   and Valgrind runs above.
 - **Linux-only.**
+
+## Roadmap
+
+Three directions, in descending order of how much they'd add.
+
+### 1. Turn it into a scheduling-policy benchmark
+
+The project currently *asserts* a placement policy. It would be far more useful
+if it **compared** them and reported numbers. Add a `--policy` flag and
+implement the classics behind a function pointer:
+
+| Policy | Description |
+|---|---|
+| `os` | No pinning at all — the kernel baseline |
+| `rr` | Round-robin across cores |
+| `least-loaded` | What the code does today |
+| `random` | Uniform random core |
+| `p2c` | Power-of-two-choices: sample two, take the better |
+| `steal` | Per-core queues with work stealing |
+
+Then run one workload through each and report makespan, per-core utilisation
+spread, and task wait-time p50/p99. This reframes the limitation above as the
+finding: *measuring* the gap to the kernel is a genuine result, and
+power-of-two-choices getting most of least-loaded's benefit at a fraction of
+the sampling cost is worth demonstrating.
+
+Two supporting pieces this needs:
+
+- A `--distribution` flag (uniform / bimodal / heavy-tailed). With today's
+  uniform 1–3 s tasks every policy looks identical; heavy-tailed workloads are
+  where placement decisions actually matter.
+- Metric aggregation — though `Task` already records `create_time`,
+  `start_time` and `end_time`, so the instrumentation largely exists.
+
+### 2. Drop the pinning and become a thread pool
+
+Replace thread-per-task with N workers looping on the queue and delete the
+affinity code. What remains is a small C thread pool with priority scheduling
+and clean shutdown — something C has no standard equivalent for, and therefore
+genuinely reusable. The hard parts (bounded multi-level queue, shutdown
+protocol, join-based lifetime) already exist.
+
+### 3. Static, topology-aware pinning
+
+Keep affinity but make it static and NUMA/hyperthread-aware, reading
+`/sys/devices/system/cpu/`. Narrower, but it is the form pinning actually takes
+in production.
+
+### Usability work, independent of the above
+
+- **Implement `load_config`.** It is still a stub that ignores its argument
+  while the config file is documented — the largest remaining gap between
+  claims and code.
+- **Real CLI flags** via `getopt_long` (`--cores`, `--tasks`, `--help`)
+  instead of positional arguments.
+- **Split the library from the demo** — build `libcpubalancer.a` plus a thin
+  `main.c`, so the balancer can be used from other code.
+- **Move the test harnesses in-tree** and add a `make test` target.
+- **`--json` output** so runs can be plotted.
+
+---
 
 See `docs/LEARNING_GUIDE.md` for the operating-systems concepts behind each
 component.
