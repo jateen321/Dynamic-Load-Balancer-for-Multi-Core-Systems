@@ -1,8 +1,11 @@
-.PHONY: all build clean rebuild run tsan asan install
+.PHONY: all build clean rebuild run bench tsan asan install
 
 BUILD_DIR ?= build
 CORES     ?= 4
 TASKS     ?= 20
+
+BENCH_CORES ?= 4
+BENCH_TASKS ?= 60
 
 all: build
 
@@ -18,6 +21,10 @@ rebuild: clean build
 # Smoke run: $(CORES) cores, $(TASKS) tasks
 run: build
 	./$(BUILD_DIR)/cpu_balancer $(CORES) $(TASKS)
+
+# Compare scheduling policies: $(BENCH_CORES) cores, $(BENCH_TASKS) tasks/policy
+bench: build
+	./$(BUILD_DIR)/cpu_balancer_bench $(BENCH_CORES) $(BENCH_TASKS)
 
 # Data-race detector build
 tsan:

@@ -19,9 +19,8 @@ add_compile_definitions(_GNU_SOURCE)
 # Check for required libraries
 find_package(Threads REQUIRED)
 
-# Define source and header files
-set(SOURCES
-    src/main.c
+# Everything except an entry point: shared by both executables below.
+set(CORE_SOURCES
     src/config.c
     src/cpu_stats.c
     src/task.c
@@ -39,24 +38,29 @@ set(HEADERS
     include/logger.h
 )
 
-# Add executable
-add_executable(cpu_balancer ${SOURCES})
+add_library(cpu_balancer_core STATIC ${CORE_SOURCES})
 
-# Include directories
-target_include_directories(cpu_balancer PRIVATE
+target_include_directories(cpu_balancer_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# Link libraries
-target_link_libraries(cpu_balancer
-    PRIVATE
+target_link_libraries(cpu_balancer_core
+    PUBLIC
         Threads::Threads
         m
         rt
 )
 
+# Main executable
+add_executable(cpu_balancer src/main.c)
+target_link_libraries(cpu_balancer PRIVATE cpu_balancer_core)
+
+# Benchmark: compares the three scheduling policies against each other.
+add_executable(cpu_balancer_bench src/benchmark.c)
+target_link_libraries(cpu_balancer_bench PRIVATE cpu_balancer_core)
+
 # Installation rules
-install(TARGETS cpu_balancer
+install(TARGETS cpu_balancer cpu_balancer_bench
     RUNTIME DESTINATION bin
 )
 

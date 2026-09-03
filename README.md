@@ -1,14 +1,17 @@
 # CPU Load Balancer
 
-A userspace load balancer that distributes CPU-bound tasks across cores. It
-reads per-core utilisation from `/proc/stat`, picks a target core with a
-cost function that blends measured load, a moving-average prediction, and the
-number of tasks already in flight, then pins each task's thread to that core
-with `pthread_setaffinity_np`.
+A userspace load balancer that distributes CPU-bound tasks across a fixed pool
+of pinned worker threads, one per core. A dispatcher thread reads a global
+priority queue and hands each task to a target core chosen by one of three
+interchangeable scheduling policies (round robin, least load, or a
+moving-average predictive blend); an idle core steals a pending task from the
+most loaded peer's queue instead of sitting empty, so placement isn't the only
+thing that's dynamic — tasks already assigned to a core can still migrate
+before they start running.
 
 Written as an operating-systems project: the interesting parts are the
 concurrency primitives (mutexes, condition variables, atomics), the shutdown
-protocol, and the scheduling policy.
+protocol, work stealing, and the scheduling policies.
 
 ## Table of Contents
 1. [Quick Start](#quick-start)
@@ -16,22 +19,25 @@ protocol, and the scheduling policy.
 3. [Components](#components)
 4. [Configuration](#configuration)
 5. [Core Features](#core-features)
-6. [Building](#building)
-7. [Verification](#verification)
-8. [Known Limitations](#known-limitations)
+6. [Benchmark Suite](#benchmark-suite)
+7. [Building](#building)
+8. [Verification](#verification)
+9. [Known Limitations](#known-limitations)
 
 ## Quick Start
 
 ```bash
 make            # configures and builds into build/
 make run        # equivalent to ./build/cpu_balancer 4 20
+make bench      # equivalent to ./build/cpu_balancer_bench 4 60
 ```
 
 Or directly:
 
 ```bash
-./build/cpu_balancer <num_cores> <num_tasks>
-./build/cpu_balancer 4 20        # 4 cores, 20 tasks
+./build/cpu_balancer <num_cores> <num_tasks> [policy]
+./build/cpu_balancer 4 20                    # 4 cores, 20 tasks, predictive (default)
+./build/cpu_balancer 4 20 round_robin        # policy: round_robin | least_load | predictive
 ```
 
 The program submits `num_tasks` synthetic CPU-bound tasks, distributes them,
@@ -57,6 +63,7 @@ File structure:
 │   └── task_queue.h
 ├── README.md
 └── src
+    ├── benchmark.c
     ├── config.c
     ├── cpu_stats.c
     ├── load_balancer.c
@@ -67,14 +74,22 @@ File structure:
 ```
 
 ### Key Features
-- Dynamic task distribution across multiple CPU cores
+- Fixed worker pool — one pinned thread per core, created once, not spawned
+  per task
+- Per-core work-stealing queues — an idle core pulls pending work from the
+  busiest peer instead of waiting
+- Three interchangeable scheduling policies: round robin, least load,
+  predictive
 - Real-time CPU load monitoring from `/proc/stat`
-- Priority-based task scheduling (4-level multi-level queue)
+- Priority-based task admission (4-level multi-level queue)
 - Moving-average load prediction
-- CPU affinity pinning, applied before a task thread first runs
+- CPU affinity pinning, applied before a worker thread first runs
 - Configurable load thresholds and monitoring interval
 - Thread-safe logging
 - Graceful shutdown on `SIGINT`
+- A benchmark suite (`cpu_balancer_bench`) comparing all three policies on
+  completion time, throughput, wait time, CPU-utilisation variance, and
+  context switches
 
 ## Architecture
 
@@ -82,8 +97,9 @@ File structure:
 Load Balancer
     ├── CPU Monitor
     │   └── CPU Stats (per core)
-    ├── Task Queue
-    │   └── 4 priority buckets
+    ├── Admission Queue (global, 4 priority buckets)
+    ├── Worker Pool (one per core)
+    │   └── Core Queue (work-stealing deque, one per worker)
     ├── Configuration
     └── Logger
 ```
@@ -91,14 +107,19 @@ Load Balancer
 ### Threading Model
 - **Monitor thread** — samples `/proc/stat` every `monitoring_interval_ms`,
   updates per-core usage and predictions, flags load imbalance.
-- **Scheduler thread** — blocks on the queue, picks a core for each task, and
-  spawns a pinned, detached thread to run it.
-- **Task threads** — one joinable thread per task, tracked in a registry so
-  shutdown joins every one of them rather than waiting on a timeout.
+- **Dispatcher thread** — blocks on the global admission queue, picks a core
+  for each task via the configured scheduling policy, and pushes it onto that
+  core's own queue. It never runs a task itself and never creates a thread.
+- **Worker threads** — a fixed pool, one per core, created once at startup and
+  pinned to their core for their entire lifetime. Each pops tasks from its own
+  queue in FIFO order; when its queue is empty it steals a task from whichever
+  peer has the deepest queue rather than blocking indefinitely. A stolen
+  task's `assigned_cpu` is updated to the core that actually ran it — that
+  reassignment is the task migration this design is built around.
 - **Main thread** — submits tasks, waits for drain, owns the shutdown sequence.
 
-`SIGINT` is blocked in the scheduler thread so the signal is always delivered
-to main.
+`SIGINT` is blocked in the dispatcher and every worker thread so the signal is
+always delivered to main.
 
 ## Components
 
@@ -109,12 +130,17 @@ LoadBalancer* init_load_balancer(LoadBalancerConfig* config);
 int  start_load_balancer(LoadBalancer* lb);          /* 0 on success, -1 on failure */
 int  submit_task(LoadBalancer* lb, void (*function)(void*), void* args,
                  TaskArgsDestructor args_free, TaskPriority priority);
+int  select_cpu(LoadBalancer* lb);                   /* dispatches by scheduling_policy */
 void stop_load_balancer(LoadBalancer* lb);
 void cleanup_load_balancer(LoadBalancer* lb);
+
+int  load_balancer_active_tasks(LoadBalancer* lb);    /* executing right now */
+int  load_balancer_pending_tasks(LoadBalancer* lb);   /* queued, not yet executing */
+int  load_balancer_worker_stats(LoadBalancer* lb, int cpu_id, WorkerStats* out);
 ```
 
 `running` is an `atomic_int`, not a plain `int` — it is written by the shutdown
-path and read by both worker threads.
+path and read by the dispatcher and every worker thread.
 
 #### Argument ownership
 
@@ -139,19 +165,44 @@ freed args on success, the library freed them on cancel, and the caller freed
 them on submit failure — which no caller could satisfy without reading the
 implementation, and which silently leaked any args holding internal pointers.
 
-#### Task thread lifetime
+#### Worker pool lifetime
 
-Task threads are joinable and registered before they can run. Shutdown closes
-the registry, waits for the live count to reach zero, and joins every thread
-before anything is freed.
+Workers are created once in `start_load_balancer()` — one per core, pinned via
+thread attributes before `pthread_create` — and joined once in
+`stop_load_balancer()`. No thread is ever created or joined per task; the
+per-task cost is now just a queue push and a queue pop.
 
-This matters because a condition variable can only report that a counter
-reached zero; `pthread_join` is the only primitive that reports that a thread
-will never execute another instruction. The earlier design detached its task
-threads and waited on a 5-second timeout, so a task outliving that timeout kept
-running while `cleanup_load_balancer` freed the balancer underneath it —
-a use-after-free on `lb->cpu_monitor`, reproducible under ASan. The timeout is
-now a diagnostic that logs and keeps waiting, never an exit.
+A worker only exits once it is certain no further task can ever reach it:
+`running` is false, the dispatcher thread has been joined (so nothing will
+ever be pushed to any core's queue again), and every core's queue — its own
+and every peer's — is observed empty. That last condition is checked without a
+global counter: once the dispatcher is gone, the total task count across every
+core queue only decreases, so a scan that finds everything empty stays correct
+even though it isn't atomic across queues.
+
+This mirrors why the previous per-task design tracked threads in a join
+registry rather than detaching them: a condition variable can only report that
+a counter reached zero, and `pthread_join` is the only primitive that reports
+a thread will never execute another instruction. Freeing the balancer while a
+worker could still touch it would be a use-after-free, so shutdown always
+joins before cleanup runs.
+
+#### Task migration and work stealing
+
+`select_cpu()` picks a core once, when a task is admitted from the global
+queue — but that placement is only ever the *first* assignment. Each core owns
+its own queue (`CoreQueue` in `task_queue.h`); when a worker finds its queue
+empty it looks for the peer with the deepest queue and, if that peer has more
+than one task queued, steals the task at the *back* of that peer's queue (the
+worker itself always drains its own queue from the *front*, so the two ends
+rarely collide). The stolen task's `Task::assigned_cpu` is updated to the
+stealing core before it runs — that reassignment is what makes "dynamic load
+balancing" apply to a task that was already assigned, not just to the
+placement decision.
+
+Stealing only ever moves a task that has not started running yet. A task
+already executing is never migrated mid-flight — see
+[Known Limitations](#known-limitations).
 
 ### 2. CPU Monitor (`cpu_stats.h`)
 
@@ -171,11 +222,15 @@ typedef struct {
 ```
 
 All `CPUStats` fields are guarded by `CPUMonitor::lock`: the monitor thread
-writes them, the scheduler thread reads them in `find_best_cpu`.
+writes them, the dispatcher thread reads them when scoring cores for
+`SCHED_LEAST_LOAD` and `SCHED_PREDICTIVE`.
 
 ### 3. Task Queue (`task_queue.h`)
 
-A multi-level queue: one FIFO ring per priority level.
+Two different queue types, serving two different roles:
+
+**Global admission queue (`TaskQueue`)** — one FIFO ring per priority level,
+fed by `submit_task()` and drained by the dispatcher thread.
 
 - Four buckets, one per `TaskPriority`
 - Dequeue serves the highest-priority non-empty bucket
@@ -183,6 +238,24 @@ A multi-level queue: one FIFO ring per priority level.
 - O(1) enqueue and dequeue
 - Bounded by `max_tasks`; producers block on `not_full`, consumers on `not_empty`
 - A `shutdown` flag in both wait predicates lets blocked threads exit
+
+**Per-core work-stealing queue (`CoreQueue`)** — one per worker, fed by the
+dispatcher and drained by its owning worker.
+
+- Unbounded, doubly-linked node list rather than a capacity-bounded ring: a
+  single core can hold more tasks over a run than the admission queue's
+  capacity ever had in flight at once, since a core's queue is replenished as
+  its worker drains it
+- The owner pops from the *front* (FIFO, preserves dispatch order); a thief
+  steals from the *back*, and only if the queue holds more than one task —
+  opposite ends reduce contention, and never taking the last task keeps an
+  idle peer from stripping work out from under the owner the instant it
+  arrives
+- `core_queue_try_steal()` uses `pthread_mutex_trylock`, not a blocking lock —
+  an idle thief must never block waiting on a busy owner
+- No priority levels: task priority is already honoured once, by the
+  admission queue that fed this core; a worker just drains its own queue in
+  the order tasks arrived
 
 ### 4. Task Management (`task.h`)
 
@@ -218,20 +291,27 @@ LoadBalancerConfig* init_default_config(void) {
     config->enable_detailed_logging = 1;
     config->log_file_path = strdup("./cpu_balancer.log");
     config->num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    config->scheduling_policy = SCHED_PREDICTIVE;
+    config->enable_work_stealing = 1;
+    config->on_task_complete = NULL;
+    config->on_task_complete_user_data = NULL;
     return config;
 }
 ```
 
 | Parameter | Meaning |
 |---|---|
-| `max_tasks` | Queue capacity; producers block when full |
+| `max_tasks` | Admission queue capacity; producers block when full |
 | `monitoring_interval_ms` | `/proc/stat` sampling period |
 | `high_load_threshold` | Usage above which a core counts as saturated |
 | `low_load_threshold` | Usage below which a core counts as idle |
 | `load_history_size` | Samples retained per core for the moving average |
 | `enable_load_prediction` | Blend predicted load into placement decisions |
 | `enable_detailed_logging` | Print per-core stats each interval |
-| `num_cpus` | Cores to distribute across |
+| `num_cpus` | Cores to distribute across; also the size of the worker pool |
+| `scheduling_policy` | `SCHED_ROUND_ROBIN` \| `SCHED_LEAST_LOAD` \| `SCHED_PREDICTIVE` |
+| `enable_work_stealing` | Let an idle core steal from the busiest peer's queue |
+| `on_task_complete` | Optional hook invoked after each task finishes, before it is freed; used by the benchmark suite to collect per-task timing without the library knowing anything about benchmarking |
 
 ## Core Features
 
@@ -265,43 +345,101 @@ double predict_cpu_load(CPUStats* cpu) {
 The average uses `history_count`, not `history_index` — the latter is a write
 cursor that wraps to zero, which would shrink the window to nothing.
 
-### 3. Task Distribution
+### 3. Task Distribution: Scheduling Policies
+
+`select_cpu()` in `load_balancer.c` dispatches to one of three policies based
+on `config->scheduling_policy`:
+
+- **`SCHED_ROUND_ROBIN`** — an atomic cursor cycles through cores in order.
+  Ignores load entirely; it exists as the baseline the other two are measured
+  against.
+- **`SCHED_LEAST_LOAD`** — current `/proc/stat` usage, biased against cores
+  with work already in flight or queued.
+- **`SCHED_PREDICTIVE`** — `SCHED_LEAST_LOAD`'s scoring blended 50/50 with the
+  moving-average prediction.
+
+`SCHED_LEAST_LOAD` and `SCHED_PREDICTIVE` share a scoring loop:
 
 ```c
-int find_best_cpu(CPUMonitor* monitor) {
-    int best_cpu = -1;
-    double lowest_load = 999.9;
+double effective_load = stats[i].current_usage;
 
-    pthread_mutex_lock(&monitor->lock);
-    for (int i = 0; i < monitor->num_cpus; i++) {
-        double effective_load = monitor->stats[i].current_usage;
-
-        if (monitor->config->enable_load_prediction) {
-            effective_load = (effective_load + monitor->stats[i].predicted_load) / 2;
-        }
-        effective_load += (monitor->stats[i].active_tasks * 10);
-
-        if (effective_load < lowest_load) {
-            lowest_load = effective_load;
-            best_cpu = i;
-        }
-    }
-    pthread_mutex_unlock(&monitor->lock);
-    return best_cpu;
+if (use_prediction && config->enable_load_prediction) {
+    effective_load = (effective_load + stats[i].predicted_load) / 2;
 }
+effective_load += (stats[i].active_tasks * 10);
+effective_load += (core_queue_size(workers[i].queue) * 5);
 ```
 
 The `active_tasks * 10` term biases against cores that already have work in
 flight. `/proc/stat` usage lags by up to one monitoring interval, so a core
 handed a task a moment ago still looks idle; without this term a burst of
-submissions all lands on the same core.
+submissions all lands on the same core. The queue-depth term is the analogous
+correction for the dispatcher itself: a burst of submissions should spread
+across cores' queues immediately, not stack up behind one core just because
+its `current_usage` hasn't risen yet.
+
+Whichever policy places a task, work stealing (see
+[Task migration and work stealing](#task-migration-and-work-stealing)) can
+still move it before it starts running — placement decides where a task
+*starts*, not where it necessarily runs.
 
 ### 4. Affinity
 
 Affinity is set on the thread *attributes* before `pthread_create`, not with
 `pthread_setaffinity_np` afterwards — a new thread is runnable the instant it
 is created, so setting affinity after the fact races with it and the first
-scheduling slice can land on the wrong core.
+scheduling slice can land on the wrong core. This now applies to worker
+threads (pinned once, at pool startup) rather than to a thread spawned per
+task.
+
+## Benchmark Suite
+
+`cpu_balancer_bench` (`src/benchmark.c`) runs the same synthetic workload
+under all three scheduling policies, back to back, and prints a comparison
+table:
+
+```bash
+make bench                                  # 4 cores, 60 tasks/policy
+./build/cpu_balancer_bench                  # same, using online core count
+./build/cpu_balancer_bench 8 200 10 80 123  # cores, tasks, min_ms, max_ms, seed
+```
+
+```
+Benchmarking scheduling policies: 4 core(s), 60 task(s)/policy, duration [20, 150] ms, seed 42
+
+Running Round Robin...
+Running Least Load...
+Running Predictive...
+
+Scheduler      Completion time   CPU imbalance   Throughput      Avg wait    Ctx switches   Migrated
+Round Robin    1.4 s             4.5%            44.2 tasks/s    582.7 ms    269            2
+Least Load     1.4 s             4.2%            44.2 tasks/s    588.3 ms    238            0
+Predictive     1.4 s             2.3%            44.1 tasks/s    586.1 ms    293            2
+
+Least Load completed fastest (1.4 s); Predictive had the least CPU imbalance (2.3%).
+```
+
+Each policy runs on a **fresh `LoadBalancer`** but the **same seeded task
+duration sequence**, so policy is the only variable across the three rows.
+Tasks are a millisecond-scale CPU-bound busy-spin (not `usleep`, which would
+make every core look idle regardless of policy).
+
+What each column measures, and how:
+
+| Column | Meaning | Source |
+|---|---|---|
+| Completion time | Wall clock from first submit to `wait_for_tasks_completion()` returning | `CLOCK_MONOTONIC` around the run |
+| CPU imbalance | Population stdev of each core's busy-time fraction of the run | `Task::assigned_cpu` + `Task::cpu_usage`, accumulated via the `on_task_complete` hook |
+| Throughput | Tasks completed per second | tasks / completion time |
+| Avg wait | Mean of `start_time - create_time` across all tasks | same hook |
+| Ctx switches | Sum of voluntary + involuntary context switches across every worker | `load_balancer_worker_stats()`, via `getrusage(RUSAGE_THREAD)` |
+| Migrated | Tasks moved by work stealing | `WorkerStats::tasks_stolen_by_me`, summed |
+
+CPU imbalance is deliberately **not** read from `CPUMonitor`'s `/proc/stat`
+samples: those reflect whole-system usage, which is noisy and not exclusively
+attributable to the benchmark's own tasks, especially on a shared or
+virtualised machine. Busy time attributed by `assigned_cpu` is exact and
+reproducible instead.
 
 ## Building
 
@@ -316,9 +454,14 @@ scheduling slice can land on the wrong core.
 ```bash
 make                 # or: cmake -S . -B build && cmake --build build
 make clean
-make tsan            # ThreadSanitizer build
-make asan            # AddressSanitizer + UBSan build
+make bench           # builds and runs the policy comparison
+make tsan            # ThreadSanitizer build (both executables)
+make asan            # AddressSanitizer + UBSan build (both executables)
 ```
+
+`cmake` produces a static library, `cpu_balancer_core`, linked into both
+`cpu_balancer` (`src/main.c`) and `cpu_balancer_bench` (`src/benchmark.c`);
+`cmake --install` installs both binaries.
 
 ## Verification
 
@@ -326,17 +469,21 @@ Checked on a 4-core Linux box, GCC 13.3:
 
 | Check | Result |
 |---|---|
-| `-Wall -Wextra -Wpedantic` | 0 warnings |
-| Normal run to completion | exit 0 |
-| `SIGINT` mid-run | graceful, time spent waiting for in-flight tasks |
-| ThreadSanitizer, normal path | 0 data races |
+| `-Wall -Wextra -Wpedantic` | 0 warnings (both executables) |
+| Normal run to completion, all 3 policies | exit 0 |
+| `SIGINT` mid-run, all 3 policies | graceful, time spent waiting for in-flight tasks |
+| Work stealing observed in normal operation | `tasks_stolen_by_me` > 0 in representative runs |
+| ThreadSanitizer, normal path, all 3 policies | 0 data races |
 | ThreadSanitizer, `SIGINT` path | 0 data races |
+| ThreadSanitizer, `cpu_balancer_bench` (concurrent `on_task_complete` hook) | 0 data races |
 | Valgrind, normal path | `All heap blocks were freed`, 0 errors |
 | Valgrind, `SIGINT` path | `All heap blocks were freed`, 0 errors |
+| ASan, `cpu_balancer_bench`, all 3 policies | 0 errors, 0 leaks |
 | ASan: task outliving shutdown | no use-after-free; cleanup blocks until joined |
 | ASan: multi-block args cancelled at shutdown | destroyed exactly once, 0 leaks |
 | ASan: non-owned args, `NULL` destructor | never freed |
-| Priority queue ordering + FIFO within level | pass |
+| Priority queue ordering + FIFO within level (admission queue) | pass |
+| `cpu_balancer_bench` output sanity (multiple core/task/seed combinations) | no NaN, plausible ranges |
 
 ## Known Limitations
 
@@ -345,12 +492,12 @@ Stated explicitly rather than implied by omission:
 - **`load_config()` is a stub.** It ignores the path and returns the defaults.
   `config/cpu_balancer.conf` is a template for the parser that would consume
   it; no configuration file is actually read.
-- **No task migration.** Placement is decided once, when the task is
-  scheduled. A task already running on a core is never moved, so a core that
-  becomes hot after placement stays hot. `check_load_balance()` logs the
-  imbalance but does not act on it.
-- **Thread-per-task, not a thread pool.** Every task gets a fresh thread.
-  Fine at this scale, wasteful at thousands of short tasks.
+- **Migration only ever moves a task that hasn't started running yet.** Work
+  stealing takes tasks off a peer's *queue*; a task already executing on a
+  core stays there until it finishes — there is no mechanism (and none is
+  planned) to preempt and relocate a running task mid-flight. A core that
+  gets stuck with one long task can still sit busy while peers steal
+  everything else out from under it.
 - **One logger per process.** The logger's state is file-scope, so two
   LoadBalancer instances in one process would share (and reconfigure) it. The
   active-task accounting is now per-instance, but the logger is not.
