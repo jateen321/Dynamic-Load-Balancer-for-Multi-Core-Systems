@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-sanitize:
+    name: Build, test, and sanitize
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential
+
+      # --- Stage 1: build -------------------------------------------------
+      - name: "Stage 1: Build (Release)"
+        run: |
+          cmake -S . -B build
+          cmake --build build
+
+      # --- Stage 2: unit tests ---------------------------------------------
+      - name: "Stage 2: Unit tests (ctest)"
+        run: ctest --test-dir build --output-on-failure
+
+      # --- Stage 3: ASan / UBSan ------------------------------------------
+      - name: "Stage 3: Build with ASan/UBSan"
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address,undefined -g -O1"
+          cmake --build build-asan
+
+      - name: "Stage 3: Run tests under ASan/UBSan"
+        run: ctest --test-dir build-asan --output-on-failure
+
+      # --- Stage 4: ThreadSanitizer ----------------------------------------
+      - name: "Stage 4: Build with ThreadSanitizer"
+        run: |
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=thread -g -O1"
+          cmake --build build-tsan
+
+      - name: "Stage 4: Run tests under ThreadSanitizer"
+        run: ctest --test-dir build-tsan --output-on-failure
