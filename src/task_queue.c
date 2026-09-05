@@ -134,25 +134,65 @@ void shutdown_task_queue(TaskQueue* queue) {
 int drain_task_queue(TaskQueue* queue) {
     if (!queue) return 0;
 
-    int dropped = 0;
-
     pthread_mutex_lock(&queue->mutex);
 
     /* Pop through the locked helper rather than dequeue_task(): the mutex is
      * not recursive, so calling the public API from here would deadlock on
-     * the lock this function already holds. */
-    Task* task;
-    while ((task = pop_highest_priority_locked(queue)) != NULL) {
-        task->status = STATUS_FAILED;
-        /* free_task() runs each task's args destructor. The library owns args
-         * on every path, so there is nothing to free by hand here — and no
-         * assumption that args is a single malloc'd block. */
-        free_task(task);
-        dropped++;
+     * the lock this function already holds. Every popped task goes into a
+     * local array instead of straight into free_task(): free_task() runs the
+     * caller's args destructor, which is arbitrary, unbounded-duration code
+     * (real cleanup work, I/O, logging — whatever the caller wrote) that has
+     * no structural need for this queue's lock. A task is fully detached from
+     * the buckets the instant pop_highest_priority_locked() returns it, so
+     * running destructors here would block every other producer/consumer of
+     * this queue for the entire sum of their durations, for no reason beyond
+     * "this loop happened to still be under the lock". queue->size is the
+     * exact number pop_highest_priority_locked() can still hand back, so it's
+     * the right fixed size for the array — no realloc/relock needed. */
+    int capacity = queue->size;
+    Task** detached = capacity > 0 ? malloc(sizeof(Task*) * (size_t)capacity) : NULL;
+    int dropped = 0;
+
+    if (capacity > 0 && !detached) {
+        /* Allocation failed: fall back to freeing under the lock rather than
+         * leaking every queued task outright. This is the only path where
+         * destructors still run with the mutex held — acceptable only because
+         * it takes catastrophic OOM to reach it, at which point lock-hold
+         * time is not the pressing problem. */
+        Task* task;
+        while ((task = pop_highest_priority_locked(queue)) != NULL) {
+            task->status = STATUS_FAILED;
+            free_task(task);
+            dropped++;
+        }
+        pthread_cond_broadcast(&queue->not_full);
+        pthread_mutex_unlock(&queue->mutex);
+        return dropped;
     }
 
+    Task* task;
+    while ((task = pop_highest_priority_locked(queue)) != NULL) {
+        detached[dropped++] = task;
+    }
+
+    /* Broadcast while the lock is still held, before running any destructor:
+     * not_full means "there is room to enqueue again", which is already true
+     * here — every bucket this loop could still drain from is now empty. A
+     * blocked producer only needs that fact to make progress; it has no
+     * reason to also wait for the detached tasks' destructors to finish, so
+     * delaying the broadcast until after the loop below would only add
+     * needless latency for waiters without buying correctness. */
     pthread_cond_broadcast(&queue->not_full);
     pthread_mutex_unlock(&queue->mutex);
+
+    /* free_task() runs each task's args destructor, now with the lock free.
+     * The library owns args on every path, so there is nothing to free by
+     * hand here — and no assumption that args is a single malloc'd block. */
+    for (int i = 0; i < dropped; i++) {
+        detached[i]->status = STATUS_FAILED;
+        free_task(detached[i]);
+    }
+    free(detached);
 
     return dropped;
 }
@@ -349,7 +389,22 @@ int core_queue_drain(CoreQueue* queue) {
 
     pthread_mutex_lock(&queue->lock);
 
-    CoreQueueNode* node = queue->head;
+    /* Detach the whole intrusive list in three assignments — pure pointer
+     * bookkeeping, no destructor calls — then walk the detached list after
+     * unlocking. free_task() runs the caller's args destructor, arbitrary and
+     * possibly slow code that doesn't need this queue's lock: every node here
+     * is already unreachable from queue->head/tail the moment it's detached,
+     * so nothing else could observe it anyway. Running destructors under the
+     * lock would block the owner's pop_own and any peer's try_steal for the
+     * whole drain instead of just for this pointer-swap. */
+    CoreQueueNode* local_head = queue->head;
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->count = 0;
+
+    pthread_mutex_unlock(&queue->lock);
+
+    CoreQueueNode* node = local_head;
     while (node) {
         CoreQueueNode* next = node->next;
         node->task->status = STATUS_FAILED;
@@ -358,11 +413,6 @@ int core_queue_drain(CoreQueue* queue) {
         node = next;
         dropped++;
     }
-    queue->head = NULL;
-    queue->tail = NULL;
-    queue->count = 0;
-
-    pthread_mutex_unlock(&queue->lock);
 
     return dropped;
 }
