@@ -5,5 +5,8 @@ build/
 build-tsan/
 build-asan/
 
+# Claude Code agent worktree bookkeeping (not project content)
+.claude/
+
 # Runtime output
 *.log
