@@ -34,6 +34,7 @@ LoadBalancer* init_load_balancer(LoadBalancerConfig* config) {
     atomic_init(&lb->tasks_in_flight, 0);
     lb->monitor_started = 0;
     lb->dispatcher_started = 0;
+    lb->stopped = 0;
     lb->workers = NULL;
 
     /* Open the logger first, so the constructors below can actually report
@@ -77,6 +78,16 @@ static void stop_and_join_workers(LoadBalancer* lb, int count) {
 
 int start_load_balancer(LoadBalancer* lb) {
     if (!lb) return -1;
+
+    /* Permanent, one-way: a LoadBalancer that has really been stopped can
+     * never be restarted (see the field's comment in load_balancer.h for
+     * why), so this must be checked before anything else below touches
+     * `workers` or the task queue. */
+    if (lb->stopped) {
+        log_message(LOG_ERROR, "Cannot restart a load balancer that has already "
+                    "been stopped; create a new one with init_load_balancer() instead");
+        return -1;
+    }
 
     if (lb->monitor_started || lb->dispatcher_started) {
         log_message(LOG_WARNING, "Load balancer already started");
@@ -555,6 +566,15 @@ void stop_load_balancer(LoadBalancer* lb) {
 
     if (atomic_exchange(&lb->running, 0) != 0) {
         log_message(LOG_INFO, "Initiating load balancer shutdown");
+
+        /* This is the one call that actually observed a running-to-stopped
+         * transition (running was really 1, and this exchange is what took
+         * it to 0), as opposed to the `else` branch below which is also
+         * reached by a never-started instance or a second/third idempotent
+         * call. Restarting after a real stop cannot work (see the field's
+         * comment in load_balancer.h), so only this branch may poison the
+         * instance against a future start_load_balancer(). */
+        lb->stopped = 1;
 
         /* Unblocks the dispatcher thread parked in dequeue_task(). Every task
          * still in the admission queue at this point gets marked FAILED by
