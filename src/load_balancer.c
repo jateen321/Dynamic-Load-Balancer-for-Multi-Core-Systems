@@ -336,8 +336,14 @@ static void run_task(LoadBalancer* lb, Worker* w, Task* task) {
     task->status = STATUS_RUNNING;
     clock_gettime(CLOCK_MONOTONIC, &task->start_time);
 
+    /* No matching atomic_fetch_add(&lb->tasks_in_flight, ...) here: the
+     * dispatcher already incremented it once, the instant this task left the
+     * admission queue (see dispatcher_thread_func) — incrementing again here
+     * would double-count every successfully-dispatched task against the
+     * single decrement at the bottom of this function, leaking tasks_in_
+     * flight upward by one per task and eventually hanging
+     * wait_for_tasks_completion() forever. */
     cpu_monitor_adjust_active_tasks(lb->cpu_monitor, w->cpu_id, +1);
-    atomic_fetch_add(&lb->tasks_in_flight, 1);
 
     task->function(task->args);
 
@@ -346,8 +352,6 @@ static void run_task(LoadBalancer* lb, Worker* w, Task* task) {
     task->cpu_usage = (task->end_time.tv_sec - task->start_time.tv_sec) +
                       (task->end_time.tv_nsec - task->start_time.tv_nsec) / 1e9;
 
-    cpu_monitor_adjust_active_tasks(lb->cpu_monitor, w->cpu_id, -1);
-    atomic_fetch_sub(&lb->tasks_in_flight, 1);
     atomic_fetch_add(&w->tasks_run, 1);
 
     log_message(LOG_INFO, "Task %d completed on CPU %d in %.3fs",
@@ -360,6 +364,22 @@ static void run_task(LoadBalancer* lb, Worker* w, Task* task) {
     }
 
     free_task(task);
+
+    /* Both "in flight" signals are dropped only now, after the hook has run
+     * and the task is freed — not right after task->function() returns.
+     * wait_for_tasks_completion()/load_balancer_active_tasks() are the only
+     * way an external caller knows it is safe to read data an on_task_complete
+     * hook accumulated (e.g. src/benchmark.c's BenchStats): dropping these
+     * earlier would let that poller observe "nothing left in flight" and
+     * read its accumulated stats while this exact task's hook call had not
+     * happened yet, silently under-counting the last task(s) to finish. This
+     * was found by re-running benchmarks/legacy-vs-pool/ after unrelated
+     * fixes landed elsewhere: a comparison driver built on this same pattern
+     * occasionally reported one fewer completed task than were actually
+     * submitted, and it always turned out to be the very last task, right at
+     * the tasks_in_flight-reaches-zero instant. */
+    cpu_monitor_adjust_active_tasks(lb->cpu_monitor, w->cpu_id, -1);
+    atomic_fetch_sub(&lb->tasks_in_flight, 1);
 }
 
 /*
@@ -469,7 +489,23 @@ void* dispatcher_thread_func(void* arg) {
         Task* task = dequeue_task(lb->task_queue);
         if (!task) break;
 
+        /* Counted as "in flight" from the instant it leaves the admission
+         * queue, not from whenever some worker eventually starts running it.
+         * Without this, a task dequeued here but not yet pushed to a
+         * CoreQueue (still being scored by select_cpu(), a handful of
+         * function calls away) is invisible to BOTH load_balancer_pending_
+         * tasks() (already gone from the admission queue, not yet in any
+         * CoreQueue) AND load_balancer_active_tasks() (run_task() hasn't
+         * started, so tasks_in_flight hasn't counted it yet either) —
+         * wait_for_tasks_completion() polling in that exact window would
+         * wrongly conclude nothing was left to do. Every exit from this loop
+         * body below either hands the task to a worker (which balances this
+         * with run_task()'s own decrement, after the hook and free) or
+         * decrements it itself before freeing the task without running it. */
+        atomic_fetch_add(&lb->tasks_in_flight, 1);
+
         if (!atomic_load(&lb->running)) {
+            atomic_fetch_sub(&lb->tasks_in_flight, 1);
             task->status = STATUS_FAILED;
             free_task(task);
             continue;
@@ -478,6 +514,7 @@ void* dispatcher_thread_func(void* arg) {
         int cpu_id = select_cpu(lb);
         if (cpu_id < 0) {
             log_message(LOG_WARNING, "No CPU available for task %d", task->task_id);
+            atomic_fetch_sub(&lb->tasks_in_flight, 1);
             task->status = STATUS_FAILED;
             free_task(task);
             continue;
@@ -496,6 +533,7 @@ void* dispatcher_thread_func(void* arg) {
             /* Only reachable if that core's queue was shut down concurrently,
              * which only happens once running is already false. */
             log_message(LOG_INFO, "Shutting down; dropping task %d", task_id);
+            atomic_fetch_sub(&lb->tasks_in_flight, 1);
             task->status = STATUS_FAILED;
             free_task(task);
             continue;

@@ -89,7 +89,18 @@ typedef struct LoadBalancer {
     atomic_int running;
 
     atomic_int rr_cursor;        /* round-robin cursor, SCHED_ROUND_ROBIN only */
-    atomic_int tasks_in_flight;  /* currently executing on some worker */
+    /* Counts a task from the instant the dispatcher dequeues it off the
+     * admission queue until a worker has fully finished with it (function
+     * run, on_task_complete hook called, Task freed) — not just while
+     * task->function() itself is running. Narrower windows were tried and
+     * both leaked a task past this counter's blind spot: counting only from
+     * "a worker started running it" left a gap between dequeue and
+     * core_queue_push() during which the task was in neither the admission
+     * queue, any CoreQueue, nor this counter; counting until only
+     * task->function() returned (rather than until the hook and free_task()
+     * were done) let a caller see "nothing in flight" and read whatever the
+     * hook had accumulated before the last task's hook call actually ran. */
+    atomic_int tasks_in_flight;
 } LoadBalancer;
 
 LoadBalancer* init_load_balancer(LoadBalancerConfig* config);
@@ -128,7 +139,13 @@ void* worker_thread_func(void* arg);
 int select_cpu(LoadBalancer* lb);
 
 /* Blocks until no task is pending or running. Polls; there is no thread to
- * join here since workers outlive any single task. */
+ * join here since workers outlive any single task. Guaranteed: by the time
+ * this returns, config->on_task_complete has already been called for every
+ * task that will ever complete — a worker only drops a task from "in
+ * flight" after that call returns, not right after the task's own function
+ * does, specifically so a caller can safely read whatever the hook
+ * accumulated immediately after this call without racing the last task's
+ * hook invocation. */
 void wait_for_tasks_completion(LoadBalancer* lb);
 
 void cancel_pending_tasks(LoadBalancer* lb);
@@ -136,7 +153,11 @@ void cancel_pending_tasks(LoadBalancer* lb);
 /* Stops the balancer, joins every worker and the dispatcher, then frees it. */
 void cleanup_load_balancer(LoadBalancer* lb);
 
-/* Tasks a worker is actively executing right now (not queued). */
+/* Tasks no longer sitting in a queue but not yet fully finished — dequeued
+ * by the dispatcher through a worker completely finishing with it (function
+ * run, on_task_complete hook called, Task freed), not just the span during
+ * which some worker is actively running task->function(); see
+ * wait_for_tasks_completion() and LoadBalancer::tasks_in_flight. */
 int load_balancer_active_tasks(LoadBalancer* lb);
 
 /* Tasks sitting in the global admission queue or a core's queue, not yet

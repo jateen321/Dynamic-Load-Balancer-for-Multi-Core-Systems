@@ -532,7 +532,7 @@ ctest --test-dir build --output-on-failure
 | `test_select_cpu` | All three `SchedulingPolicy` values, white-box against `cpu_monitor->stats` — round robin's cycle order, least-load's and predictive's scoring (including the active-tasks and queue-depth terms, the blended average, and the `enable_load_prediction=0` fallback) |
 | `test_cpu_stats` | The first `/proc/stat` sample establishes a baseline only — `current_usage`/`history_count` stay untouched until the second sample |
 | `test_task_ownership` | `submit_task`'s destructor-exactly-once contract across success, rejection, and cancellation at shutdown |
-| `test_shutdown` | Nothing left pending/active after `stop_load_balancer`; safe to call twice; restarting a stopped balancer is rejected |
+| `test_shutdown` | Nothing left pending/active after `stop_load_balancer`; safe to call twice; restarting a stopped balancer is rejected; `wait_for_tasks_completion()` never returns before every task's `on_task_complete` hook has actually finished |
 | `test_concurrent_producers` | Multiple threads racing `enqueue_task`/`submit_task` lose or duplicate nothing; `load_balancer_worker_stats()` is safe to call from another thread while the pool is actively running |
 | `test_drain_lock_hygiene` | Draining a queue at shutdown runs task destructors after releasing the queue lock, not while holding it |
 

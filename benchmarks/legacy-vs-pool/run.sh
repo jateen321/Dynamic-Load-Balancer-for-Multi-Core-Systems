@@ -14,6 +14,18 @@
 # Usage: benchmarks/legacy-vs-pool/run.sh [num_cores] [task_counts...]
 #   num_cores:   defaults to nproc
 #   task_counts: defaults to "50 200 800 2000"
+#   MIN_MS/MAX_MS (env vars, default 5/15): per-task duration range in ms.
+#     The old design's task-drop bug (see RESULTS.md section 4) is a race
+#     between thread-creation rate and task-completion rate, so whether a
+#     given (num_cores, task_count, MIN_MS, MAX_MS) combination trips it
+#     depends on the host machine's current pthread_create latency — it is
+#     NOT guaranteed to reproduce with the defaults on every machine or every
+#     run. If a run completes 100% on the old side and you want to see the
+#     bug, try widening the range, e.g.:
+#       MIN_MS=50 MAX_MS=100 benchmarks/legacy-vs-pool/run.sh 4 "800 2000"
+#     Longer per-task durations keep more threads "active" at once before any
+#     finish, which is what actually trips the bug, and reproduced it far
+#     more consistently than short durations do when this was last checked.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -29,8 +41,8 @@ if [ "${#TASK_COUNTS[@]}" -eq 1 ] && [[ "${TASK_COUNTS[0]}" == *" "* ]]; then
     read -r -a TASK_COUNTS <<< "${TASK_COUNTS[0]}"
 fi
 
-MIN_MS=5
-MAX_MS=15
+MIN_MS="${MIN_MS:-5}"
+MAX_MS="${MAX_MS:-15}"
 SEED=42
 
 echo "== Setting up the pre-rewrite (thread-per-task) worktree at $LEGACY_COMMIT ==" >&2
