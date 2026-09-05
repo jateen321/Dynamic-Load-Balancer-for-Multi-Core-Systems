@@ -115,10 +115,10 @@ int start_load_balancer(LoadBalancer* lb) {
         w->lb = lb;
         w->cpu_id = i;
         w->started = 0;
-        w->tasks_run = 0;
-        w->tasks_stolen_by_me = 0;
-        w->voluntary_ctxt_switches = 0;
-        w->involuntary_ctxt_switches = 0;
+        atomic_init(&w->tasks_run, 0);
+        atomic_init(&w->tasks_stolen_by_me, 0);
+        atomic_init(&w->voluntary_ctxt_switches, 0);
+        atomic_init(&w->involuntary_ctxt_switches, 0);
 
         w->queue = init_core_queue();
         if (!w->queue) {
@@ -337,7 +337,7 @@ static void run_task(LoadBalancer* lb, Worker* w, Task* task) {
 
     cpu_monitor_adjust_active_tasks(lb->cpu_monitor, w->cpu_id, -1);
     atomic_fetch_sub(&lb->tasks_in_flight, 1);
-    w->tasks_run++;
+    atomic_fetch_add(&w->tasks_run, 1);
 
     log_message(LOG_INFO, "Task %d completed on CPU %d in %.3fs",
                 task->task_id, w->cpu_id, task->cpu_usage);
@@ -375,7 +375,7 @@ static Task* steal_from_peers(LoadBalancer* lb, Worker* self) {
 
     Task* task = core_queue_try_steal(lb->workers[victim].queue);
     if (task) {
-        self->tasks_stolen_by_me++;
+        atomic_fetch_add(&self->tasks_stolen_by_me, 1);
         log_message(LOG_DEBUG, "CPU %d stole task %d from CPU %d",
                     self->cpu_id, task->task_id, victim);
     }
@@ -407,8 +407,8 @@ static int worker_should_exit(LoadBalancer* lb) {
 static void record_thread_rusage(Worker* w) {
     struct rusage usage;
     if (getrusage(RUSAGE_THREAD, &usage) == 0) {
-        w->voluntary_ctxt_switches = usage.ru_nvcsw;
-        w->involuntary_ctxt_switches = usage.ru_nivcsw;
+        atomic_store(&w->voluntary_ctxt_switches, usage.ru_nvcsw);
+        atomic_store(&w->involuntary_ctxt_switches, usage.ru_nivcsw);
     }
 }
 
@@ -520,11 +520,11 @@ int load_balancer_worker_stats(LoadBalancer* lb, int cpu_id, WorkerStats* out) {
 
     Worker* w = &lb->workers[cpu_id];
     out->cpu_id = w->cpu_id;
-    out->tasks_run = w->tasks_run;
-    out->tasks_stolen_by_me = w->tasks_stolen_by_me;
-    out->tasks_stolen_from_me = w->queue ? w->queue->stolen_total : 0;
-    out->voluntary_ctxt_switches = w->voluntary_ctxt_switches;
-    out->involuntary_ctxt_switches = w->involuntary_ctxt_switches;
+    out->tasks_run = atomic_load(&w->tasks_run);
+    out->tasks_stolen_by_me = atomic_load(&w->tasks_stolen_by_me);
+    out->tasks_stolen_from_me = w->queue ? core_queue_stolen_total(w->queue) : 0;
+    out->voluntary_ctxt_switches = atomic_load(&w->voluntary_ctxt_switches);
+    out->involuntary_ctxt_switches = atomic_load(&w->involuntary_ctxt_switches);
     return 0;
 }
 

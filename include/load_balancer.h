@@ -15,11 +15,12 @@ struct LoadBalancer;
  * stop_load_balancer() — a genuine pool, not a thread spawned per task. Each
  * worker is pinned to its cpu_id and owns exactly one CoreQueue.
  *
- * The stat fields are written only by the worker's own thread while it runs,
- * so they need no lock; they are only meaningful for reading after the
- * worker has been joined (load_balancer_worker_stats() enforces that by
- * being called from stop/cleanup paths and by benchmarking after a full
- * stop_load_balancer()).
+ * The stat fields are single-writer (only this worker's own thread ever
+ * writes each one) / multi-reader (any thread may call
+ * load_balancer_worker_stats() at any time, pool running or stopped), so they
+ * are atomic_long rather than behind a lock: the writer side just needs
+ * atomic_fetch_add/atomic_store instead of `x++`, and a reader gets a
+ * consistent value via atomic_load without ever blocking on the worker.
  */
 typedef struct Worker {
     struct LoadBalancer* lb;
@@ -28,13 +29,16 @@ typedef struct Worker {
     pthread_t thread;
     int started;   /* this slot's pthread_create succeeded */
 
-    long tasks_run;              /* executed by this worker, own or stolen */
-    long tasks_stolen_by_me;     /* taken from a peer's queue */
-    long voluntary_ctxt_switches;    /* getrusage(RUSAGE_THREAD), sampled at exit */
-    long involuntary_ctxt_switches;
+    atomic_long tasks_run;              /* executed by this worker, own or stolen */
+    atomic_long tasks_stolen_by_me;     /* taken from a peer's queue */
+    atomic_long voluntary_ctxt_switches;    /* getrusage(RUSAGE_THREAD), sampled at exit */
+    atomic_long involuntary_ctxt_switches;
 } Worker;
 
-/* Snapshot returned by load_balancer_worker_stats(); a copy, not a live view. */
+/* Snapshot returned by load_balancer_worker_stats(); a copy, not a live view.
+ * Plain long, not atomic: this struct is filled once and handed back by
+ * value/out-pointer, never shared or written concurrently itself — only the
+ * live Worker fields it is copied from need to be atomic. */
 typedef struct {
     int cpu_id;
     long tasks_run;
@@ -113,8 +117,13 @@ int load_balancer_active_tasks(LoadBalancer* lb);
 int load_balancer_pending_tasks(LoadBalancer* lb);
 
 /* Copies worker `cpu_id`'s stats into `out`. Returns 0 on success, -1 if
- * cpu_id is out of range or the pool was never started. Meant to be called
- * after stop_load_balancer() so the values are final. */
+ * cpu_id is out of range or the pool was never started. Safe to call at any
+ * time, including while the pool is running and the worker is actively
+ * updating these fields: every Worker-owned counter it reads is atomic_long,
+ * and tasks_stolen_from_me is read through core_queue_stolen_total(), which
+ * takes the queue's own lock rather than reading CoreQueue::stolen_total
+ * directly. A call while running just returns whatever snapshot was true at
+ * that instant, not a "final" value. */
 int load_balancer_worker_stats(LoadBalancer* lb, int cpu_id, WorkerStats* out);
 
 #endif

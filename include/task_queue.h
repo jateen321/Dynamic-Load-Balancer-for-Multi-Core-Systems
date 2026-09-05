@@ -111,6 +111,12 @@ Task* core_queue_try_steal(CoreQueue* queue);
 /* Current number of queued tasks, read under the queue lock. */
 int core_queue_size(CoreQueue* queue);
 
+/* Total tasks ever stolen from this queue by a peer, read under the queue
+ * lock — stolen_total is written by core_queue_try_steal() under that same
+ * lock, so a direct unlocked read would race with it; this mirrors
+ * core_queue_size()'s pattern for the analogous `count` field. */
+long core_queue_stolen_total(CoreQueue* queue);
+
 /* Marks the queue shut down and wakes anyone blocked in pop_own. Does not
  * discard queued tasks — that is core_queue_drain's job. */
 void core_queue_shutdown(CoreQueue* queue);
