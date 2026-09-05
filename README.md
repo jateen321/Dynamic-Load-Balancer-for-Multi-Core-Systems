@@ -22,11 +22,12 @@ protocol, work stealing, and the scheduling policies.
 4. [Configuration](#configuration)
 5. [Core Features](#core-features)
 6. [Benchmark Suite](#benchmark-suite)
-7. [Testing](#testing)
-8. [Building](#building)
-9. [Continuous Integration](#continuous-integration)
-10. [Verification](#verification)
-11. [Known Limitations](#known-limitations)
+7. [Performance: Before vs. After the Worker-Pool Rewrite](#performance-before-vs-after-the-worker-pool-rewrite)
+8. [Testing](#testing)
+9. [Building](#building)
+10. [Continuous Integration](#continuous-integration)
+11. [Verification](#verification)
+12. [Known Limitations](#known-limitations)
 
 ## Quick Start
 
@@ -57,6 +58,8 @@ File structure:
 │       └── ci.yml            # build -> unit tests -> ASan/UBSan -> ThreadSanitizer
 ├── CMakeLists.txt
 ├── Makefile
+├── benchmarks
+│   └── legacy-vs-pool        # reproducible before/after evidence, see RESULTS.md
 ├── config
 │   └── cpu_balancer.conf     # parsed by load_config()
 ├── docs
@@ -465,6 +468,36 @@ samples: those reflect whole-system usage, which is noisy and not exclusively
 attributable to the benchmark's own tasks, especially on a shared or
 virtualised machine. Busy time attributed by `assigned_cpu` is exact and
 reproducible instead.
+
+## Performance: Before vs. After the Worker-Pool Rewrite
+
+`cpu_balancer_bench` compares scheduling policies against each other *within*
+the current design. `benchmarks/legacy-vs-pool/` answers a different
+question: is the worker pool actually better than the thread-per-task design
+it replaced? Full methodology, reproduction instructions
+(`benchmarks/legacy-vs-pool/run.sh`), and complete results are in
+[`benchmarks/legacy-vs-pool/RESULTS.md`](benchmarks/legacy-vs-pool/RESULTS.md).
+Headline findings, measured on the same 4-core machine with an identical
+seeded workload on both sides:
+
+| | Old (thread-per-task) | New (worker pool) |
+|---|---|---|
+| Per-task dispatch cost | ~0.06 ms (`pthread_create`+`pthread_join`) | ~0.0001 ms (queue push+pop) — **~500-650× less** |
+| Peak concurrent OS threads, 800-task workload | **761** | **7** (fixed, regardless of task count) |
+| Tasks completed under a submission burst of 800/2000 | **53–65% / 19–48%** — the rest are silently dropped | **100%, every run** |
+
+That last row is the one that actually matters. It is not a close call on
+speed — under load, the old design's `find_best_cpu()` has a sentinel bug
+(explained in full in RESULTS.md) that silently drops the *majority* of
+submitted tasks once enough are concurrently in flight, logging a warning
+and never running them. This is inherent to unbounded thread-per-task
+concurrency, is timing-dependent (hence the wide ranges above), and was
+never triggered by the old design's own tests because they never submitted
+enough concurrent work to hit it. The worker pool's fixed thread count
+removes the bug's precondition structurally, not by raising a threshold —
+per-core `active_tasks` never exceeds what a single worker can be running
+at once. At small submission scales, where the old design doesn't trip this
+bug, the two are comparable on raw completion time (see RESULTS.md section 3).
 
 ## Testing
 
