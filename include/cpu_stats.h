@@ -22,6 +22,14 @@ typedef struct {
     double temperature;
     double predicted_load;
     int active_tasks;
+    /* Set once update_cpu_stats() has stored one real /proc/stat sample for
+     * this core. Without this, the first read has nothing valid to diff
+     * against (all *_time fields are still 0), so the delta would silently
+     * become "since boot" instead of "since the previous sample" — this flag
+     * is what lets update_cpu_stats() recognize that case and skip computing
+     * a usage figure from it, rather than baking a meaningless number into
+     * current_usage/usage_history. */
+    int has_baseline;
 } CPUStats;
 
 typedef struct {

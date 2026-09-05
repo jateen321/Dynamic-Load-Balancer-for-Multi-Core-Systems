@@ -69,6 +69,7 @@ set(TEST_SOURCES
     tests/test_task_queue_capacity.c
     tests/test_core_queue.c
     tests/test_select_cpu.c
+    tests/test_cpu_stats.c
     tests/test_task_ownership.c
     tests/test_shutdown.c
     tests/test_concurrent_producers.c

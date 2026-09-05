@@ -23,7 +23,10 @@ CPUMonitor* init_cpu_monitor(LoadBalancerConfig* config) {
 
         /* Every field must start at a known value: update_cpu_stats() subtracts
          * the previous jiffie counters from the current ones, so uninitialized
-         * *_time fields would make the very first usage reading garbage. */
+         * *_time fields would make the very first usage reading garbage. This
+         * memset is also what gives has_baseline its correct starting value of
+         * 0, which is what tells update_cpu_stats() that this core has no real
+         * previous sample yet (see the comment at has_baseline's use there). */
         memset(cpu, 0, sizeof(*cpu));
         cpu->cpu_id = i;
 
@@ -75,23 +78,48 @@ void update_cpu_stats(CPUMonitor* monitor) {
                 continue;
             }
 
+            /* The very first sample for a core has no real previous reading to
+             * diff against: every cpu->*_time field is still the memset-zero
+             * from init_cpu_monitor(), so prev_total/prev_idle would compute
+             * to 0 and the "delta" below would actually be the full jiffie
+             * counts since boot — a real number, but meaningless as "usage
+             * over the sampling interval", and one that would otherwise get
+             * baked into current_usage/usage_history as if it were a genuine
+             * measurement. Just establish the baseline instead: store the raw
+             * counters, mark it, and wait for the second call (which now has
+             * a real previous sample) to produce the first actual usage
+             * figure. */
+            if (!cpu->has_baseline) {
+                cpu->user_time = user;
+                cpu->nice_time = nice;
+                cpu->system_time = system;
+                cpu->idle_time = idle;
+                cpu->iowait_time = iowait;
+                cpu->irq_time = irq;
+                cpu->softirq_time = softirq;
+                cpu->steal_time = steal;
+                cpu->has_baseline = 1;
+                continue;
+            }
+
             uint64_t prev_idle = cpu->idle_time + cpu->iowait_time;
             uint64_t idle_time = idle + iowait;
-            
+
             uint64_t prev_total = cpu->user_time + cpu->nice_time +
                                 cpu->system_time + prev_idle +
                                 cpu->irq_time + cpu->softirq_time +
                                 cpu->steal_time;
-            
+
             uint64_t total_time = user + nice + system + idle_time +
                                 irq + softirq + steal;
-            
+
             uint64_t total_delta = total_time - prev_total;
             uint64_t idle_delta = idle_time - prev_idle;
 
-            /* No jiffies elapsed between samples (first reading, or polled
-             * faster than the kernel's tick): keep the previous figure rather
-             * than dividing by zero. */
+            /* No jiffies elapsed between samples (polled faster than the
+             * kernel's tick — the first-reading case is already handled
+             * above by the has_baseline check): keep the previous figure
+             * rather than dividing by zero. */
             if (total_delta > 0) {
                 cpu->current_usage =
                     100.0 * (1.0 - ((double)idle_delta / (double)total_delta));
@@ -114,7 +142,7 @@ void update_cpu_stats(CPUMonitor* monitor) {
             cpu->irq_time = irq;
             cpu->softirq_time = softirq;
             cpu->steal_time = steal;
-            
+
             if (monitor->config->enable_load_prediction) {
                 cpu->predicted_load = predict_cpu_load(cpu);
             }
