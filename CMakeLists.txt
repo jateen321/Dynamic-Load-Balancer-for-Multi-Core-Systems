@@ -72,6 +72,7 @@ set(TEST_SOURCES
     tests/test_task_ownership.c
     tests/test_shutdown.c
     tests/test_concurrent_producers.c
+    tests/test_drain_lock_hygiene.c
 )
 
 foreach(test_src ${TEST_SOURCES})
