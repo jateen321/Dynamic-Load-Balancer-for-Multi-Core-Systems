@@ -80,6 +80,37 @@ static void test_stop_on_never_started(void) {
     free_config(cfg);
 }
 
+/* A LoadBalancer that was actually started and then stopped must reject a
+ * second start_load_balancer() call outright rather than silently leaking
+ * the old worker pool and coming back up inert (the task queue's `shutdown`
+ * flag is permanent, so a "restarted" dispatcher would see it shut down and
+ * exit immediately without running anything). The rejected restart must also
+ * leave the object exactly as safely-stopped as it already was — no crash,
+ * and no tasks pending/active despite the failed attempt to bring it back up. */
+static void test_restart_after_stop_is_rejected(void) {
+    LoadBalancerConfig* cfg = test_config(test_clamp_cpus(2), 8, SCHED_ROUND_ROBIN, 0);
+    LoadBalancer* lb = init_load_balancer(cfg);
+    CHECK(lb != NULL);
+    CHECK(start_load_balancer(lb) == 0);
+
+    stop_load_balancer(lb);
+    CHECK(load_balancer_pending_tasks(lb) == 0);
+    CHECK(load_balancer_active_tasks(lb) == 0);
+
+    CHECK(start_load_balancer(lb) == -1);
+    CHECK(load_balancer_pending_tasks(lb) == 0);
+    CHECK(load_balancer_active_tasks(lb) == 0);
+
+    /* The rejected restart must not have left anything half-started that a
+     * subsequent stop/cleanup would trip over. */
+    stop_load_balancer(lb);
+    CHECK(load_balancer_pending_tasks(lb) == 0);
+    CHECK(load_balancer_active_tasks(lb) == 0);
+
+    cleanup_load_balancer(lb);
+    free_config(cfg);
+}
+
 /* NULL must be tolerated everywhere the API takes a LoadBalancer*, matching
  * every other public entry point's own `if (!lb) return` guard. */
 static void test_null_lb_is_safe(void) {
@@ -96,6 +127,7 @@ static void test_null_lb_is_safe(void) {
 int main(void) {
     test_stop_is_idempotent_after_normal_completion();
     test_stop_on_never_started();
+    test_restart_after_stop_is_rejected();
     test_null_lb_is_safe();
 
     test_pass(__FILE__);

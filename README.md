@@ -161,6 +161,16 @@ int  load_balancer_worker_stats(LoadBalancer* lb, int cpu_id, WorkerStats* out);
 `running` is an `atomic_int`, not a plain `int` — it is written by the shutdown
 path and read by the dispatcher and every worker thread.
 
+`start_load_balancer()` is one-shot: once a `LoadBalancer` has actually been
+started and later stopped (via `stop_load_balancer()`, directly or through
+`cleanup_load_balancer()`), calling `start_load_balancer()` on it again returns
+-1 immediately rather than attempting it. A stopped task queue can't be
+un-shut-down and the old worker pool isn't safely reusable, so a restart in
+place would either leak the old workers or come up silently inert; create a
+fresh `LoadBalancer` with `init_load_balancer()` instead. A `LoadBalancer` that
+was never started, or whose `start_load_balancer()` call failed, is unaffected
+and can still be started normally.
+
 #### Argument ownership
 
 `submit_task` **takes ownership of `args` on entry**. On return — success or
@@ -620,6 +630,10 @@ Stated explicitly rather than implied by omission:
   active-task accounting is now per-instance, but the logger is not.
 - **`stop_load_balancer` is idempotent for sequential calls, not for
   concurrent ones.** Two threads calling it at once is not supported.
+- **A `LoadBalancer` cannot be restarted once actually stopped.** This is
+  enforced, not merely undocumented: `start_load_balancer()` returns -1 on a
+  `LoadBalancer` that was started and later stopped. Use a new instance from
+  `init_load_balancer()` instead of trying to reuse one.
 - **`CPUStats::temperature` is never populated.** The field exists; nothing
   reads a thermal zone.
 - **`load_config()`'s parser is intentionally minimal.** It handles the flat,

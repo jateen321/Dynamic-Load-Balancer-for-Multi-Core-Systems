@@ -55,6 +55,24 @@ typedef struct LoadBalancer {
     int monitor_started;
     int dispatcher_started;
 
+    /* Set once this instance has gone through a real running-to-stopped
+     * transition, and never cleared. A restart is impossible to make work
+     * correctly after that point: the task queue's `shutdown` flag is
+     * permanent (task_queue.c has no "unshutdown"), so a new dispatcher would
+     * see the queue already shut down and exit immediately, and re-running
+     * start_load_balancer() would also overwrite `workers` — leaking the old
+     * array and every worker's CoreQueue, since nothing but
+     * cleanup_load_balancer() ever frees them. Rather than let that happen
+     * silently, start_load_balancer() checks this flag and refuses outright.
+     * It is written only from inside stop_load_balancer()'s
+     * atomic_exchange(&lb->running, 0) branch — i.e. only on the call that
+     * actually observed `running` transition from 1 to 0 — never from the
+     * "never started, or already stopped" branch, so that calling
+     * stop_load_balancer()/cleanup_load_balancer() on a LoadBalancer that was
+     * never successfully started (or whose start failed) does not falsely
+     * poison it against a future start. */
+    int stopped;
+
     /* Set once the dispatcher thread has been joined, i.e. once it is
      * certain no further task will ever be pushed into any CoreQueue. A
      * worker is only allowed to exit once this is set AND every CoreQueue —
@@ -84,6 +102,15 @@ int submit_task(LoadBalancer* lb, void (*function)(void*), void* args,
  * Returns 0 on success. On failure returns -1, logs the reason, leaves no
  * thread running, and leaves lb valid — the caller must still dispose of it
  * with cleanup_load_balancer().
+ *
+ * One-shot: once a LoadBalancer has actually been started and later stopped
+ * via stop_load_balancer() (directly, or via cleanup_load_balancer()), it can
+ * never be started again — this returns -1 immediately instead of attempting
+ * it. A stopped instance's task queue is permanently shut down and its
+ * worker/CoreQueue pool is not safely reusable, so restarting in place is not
+ * supported; create a fresh LoadBalancer with init_load_balancer() instead. A
+ * LoadBalancer that was never started, or whose start_load_balancer() call
+ * failed, is not affected by this and may still be started normally.
  */
 int start_load_balancer(LoadBalancer* lb);
 
