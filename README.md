@@ -530,9 +530,11 @@ ctest --test-dir build --output-on-failure
 | `test_task_queue_capacity` | A blocked producer on a full queue unblocks on either free space or shutdown |
 | `test_core_queue` | Per-core queue FIFO from the owner; `try_steal` refuses at count ≤ 1 and takes the tail above it; concurrent push/pop/steal loses nothing |
 | `test_select_cpu` | All three `SchedulingPolicy` values, white-box against `cpu_monitor->stats` — round robin's cycle order, least-load's and predictive's scoring (including the active-tasks and queue-depth terms, the blended average, and the `enable_load_prediction=0` fallback) |
+| `test_cpu_stats` | The first `/proc/stat` sample establishes a baseline only — `current_usage`/`history_count` stay untouched until the second sample |
 | `test_task_ownership` | `submit_task`'s destructor-exactly-once contract across success, rejection, and cancellation at shutdown |
-| `test_shutdown` | Nothing left pending/active after `stop_load_balancer`; safe to call twice; NULL-`lb` safety |
-| `test_concurrent_producers` | Multiple threads racing `enqueue_task`/`submit_task` lose or duplicate nothing |
+| `test_shutdown` | Nothing left pending/active after `stop_load_balancer`; safe to call twice; restarting a stopped balancer is rejected |
+| `test_concurrent_producers` | Multiple threads racing `enqueue_task`/`submit_task` lose or duplicate nothing; `load_balancer_worker_stats()` is safe to call from another thread while the pool is actively running |
+| `test_drain_lock_hygiene` | Draining a queue at shutdown runs task destructors after releasing the queue lock, not while holding it |
 
 Most tests run through the public API only; `test_select_cpu` is white-box —
 `LoadBalancer`, `CPUMonitor`, `TaskQueue`, and `CoreQueue` are all fully
@@ -599,9 +601,9 @@ Checked on a 4-core Linux box, GCC 13.3:
 | Normal run to completion, all 3 policies | exit 0 |
 | `SIGINT` mid-run, all 3 policies | graceful, time spent waiting for in-flight tasks |
 | Work stealing observed in normal operation | `tasks_stolen_by_me` > 0 in representative runs |
-| `ctest`, Release build | 7/7 tests pass |
-| `ctest`, ThreadSanitizer build | 7/7 tests pass, 0 data races, stable across repeated runs |
-| `ctest`, ASan/UBSan build | 7/7 tests pass, 0 errors, 0 leaks, stable across repeated runs |
+| `ctest`, Release build | 9/9 tests pass |
+| `ctest`, ThreadSanitizer build | 9/9 tests pass, 0 data races, stable across repeated runs |
+| `ctest`, ASan/UBSan build | 9/9 tests pass, 0 errors, 0 leaks, stable across repeated runs |
 | ThreadSanitizer, `cpu_balancer` normal path, all 3 policies | 0 data races |
 | ThreadSanitizer, `cpu_balancer` `SIGINT` path | 0 data races |
 | ThreadSanitizer, `cpu_balancer_bench` (concurrent `on_task_complete` hook) | 0 data races |
