@@ -178,9 +178,101 @@ static void test_concurrent_submit_task(void) {
     free_config(cfg);
 }
 
+/* ---------------------------------------------------------------------------
+ * Level 3: load_balancer_worker_stats() called from a reader thread while the
+ * pool is actively running and its workers are still writing the very
+ * counters this function reads. This is exactly the scenario the function's
+ * own fields (atomic_long in Worker, a locked accessor for
+ * CoreQueue::stolen_total) are meant to make safe regardless of whether the
+ * pool has been stopped yet.
+ * ------------------------------------------------------------------------ */
+
+typedef struct {
+    LoadBalancer* lb;
+    int num_cpus;
+    atomic_int* stop;
+} StatsReaderArg;
+
+/* Hammers load_balancer_worker_stats() for every cpu_id while producers and
+ * workers are concurrently submitting/running/stealing tasks. Never asserts
+ * on *which* values come back — only that the call itself never crashes and
+ * every field is non-negative, since a live snapshot can legitimately be
+ * "0 tasks run so far" or change between two calls. */
+static void* stats_reader(void* arg) {
+    StatsReaderArg* r = (StatsReaderArg*)arg;
+    while (!atomic_load(r->stop)) {
+        for (int i = 0; i < r->num_cpus; i++) {
+            WorkerStats stats;
+            memset(&stats, 0, sizeof(stats));
+            CHECK(load_balancer_worker_stats(r->lb, i, &stats) == 0);
+            CHECK(stats.cpu_id == i);
+            CHECK(stats.tasks_run >= 0);
+            CHECK(stats.tasks_stolen_by_me >= 0);
+            CHECK(stats.tasks_stolen_from_me >= 0);
+            CHECK(stats.voluntary_ctxt_switches >= 0);
+            CHECK(stats.involuntary_ctxt_switches >= 0);
+        }
+    }
+    return NULL;
+}
+
+static void test_worker_stats_safe_while_running(void) {
+    LoadBalancerConfig* cfg = test_config(test_clamp_cpus(4), 16, SCHED_LEAST_LOAD, 1);
+    LoadBalancer* lb = init_load_balancer(cfg);
+    CHECK(lb != NULL);
+    CHECK(start_load_balancer(lb) == 0);
+
+    atomic_int stop;
+    atomic_init(&stop, 0);
+    StatsReaderArg reader_arg = { .lb = lb, .num_cpus = cfg->num_cpus, .stop = &stop };
+    pthread_t reader;
+    CHECK(pthread_create(&reader, NULL, stats_reader, &reader_arg) == 0);
+
+    atomic_int ran;
+    atomic_init(&ran, 0);
+
+    pthread_t producers[LPRODUCERS];
+    LProducerArg args[LPRODUCERS];
+    for (int i = 0; i < LPRODUCERS; i++) {
+        args[i].lb = lb;
+        args[i].ran = &ran;
+        args[i].failures = 0;
+        CHECK(pthread_create(&producers[i], NULL, l_producer, &args[i]) == 0);
+    }
+    for (int i = 0; i < LPRODUCERS; i++) {
+        pthread_join(producers[i], NULL);
+        CHECK(args[i].failures == 0);
+    }
+
+    wait_for_tasks_completion(lb);
+    CHECK(atomic_load(&ran) == LTOTAL);
+
+    /* The reader keeps hammering stats through stop_load_balancer() itself,
+     * covering the running-to-stopped transition, not just steady state. */
+    stop_load_balancer(lb);
+
+    atomic_store(&stop, 1);
+    pthread_join(reader, NULL);
+
+    /* Now that every worker is joined, a final read must show the exact
+     * totals: nothing lost, nothing double-counted by the concurrent reads
+     * that happened while the pool was still live. */
+    long total_run = 0;
+    for (int i = 0; i < cfg->num_cpus; i++) {
+        WorkerStats stats;
+        CHECK(load_balancer_worker_stats(lb, i, &stats) == 0);
+        total_run += stats.tasks_run;
+    }
+    CHECK(total_run == LTOTAL);
+
+    cleanup_load_balancer(lb);
+    free_config(cfg);
+}
+
 int main(void) {
     test_concurrent_enqueue_dequeue();
     test_concurrent_submit_task();
+    test_worker_stats_safe_while_running();
 
     test_pass(__FILE__);
     return 0;

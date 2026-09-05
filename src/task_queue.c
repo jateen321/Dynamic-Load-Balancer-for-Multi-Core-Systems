@@ -333,6 +333,16 @@ int core_queue_size(CoreQueue* queue) {
     return size;
 }
 
+long core_queue_stolen_total(CoreQueue* queue) {
+    if (!queue) return 0;
+
+    pthread_mutex_lock(&queue->lock);
+    long stolen = queue->stolen_total;
+    pthread_mutex_unlock(&queue->lock);
+
+    return stolen;
+}
+
 void core_queue_shutdown(CoreQueue* queue) {
     if (!queue) return;
 
